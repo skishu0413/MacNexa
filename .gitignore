@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+*.moved-aside
+
+# Swift Package Manager
+.build/
+**/.build/
+.swiftpm/
+Package.resolved
+
+# Generated Xcode project (regenerate with `xcodegen generate`)
+MacNexa.xcodeproj/
+
+# Secrets / local config (never commit)
+*.p12
+*.mobileprovision
+.env
+
+# Probe tool build
+Tools/**/.build/
+
+# Editor settings
+.vscode/
+.idea/
+
+# Logs
+*.log
+# Developer skills / working agreements (local only)
+.skills/
+
+# Architecture & implementation spec (local only)
+MacNexa — Architecture & Implementation Specification.md

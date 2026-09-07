@@ -1,0 +1,45 @@
+name: MacNexa
+options:
+  bundleIdPrefix: com.macnexa
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+
+packages:
+  MacNexaCore:
+    path: MacNexaCore
+
+targets:
+  MacNexa:
+    type: application
+    platform: macOS
+    sources:
+      - MacNexa
+    dependencies:
+      - package: MacNexaCore
+        product: MacNexaCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.macnexa.app
+        INFOPLIST_FILE: MacNexa/Resources/Info.plist
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_VERSION: "5.9"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        Debug:
+          # Local dev: non-sandboxed so ad-hoc-signed builds launch.
+          CODE_SIGN_ENTITLEMENTS: MacNexa/Resources/MacNexa-Debug.entitlements
+        Release:
+          # Distribution: full sandbox + hardened runtime (spec §43).
+          CODE_SIGN_ENTITLEMENTS: MacNexa/Resources/MacNexa.entitlements
+
+schemes:
+  MacNexa:
+    build:
+      targets:
+        MacNexa: all
+    run:
+      environmentVariables:
+        MACNEXA_USE_IOBLUETOOTH: "1"
