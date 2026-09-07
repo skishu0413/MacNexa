@@ -56,16 +56,27 @@ final class AppServices {
         discovery.onPeersChanged = { [weak self] found in
             guard let self else { return }
             Task { @MainActor in
-                self.discovered = Dictionary(uniqueKeysWithValues: found.map { ($0.id, $0) })
-                onChange(self.mapPeers(found))
+                // Never treat this Mac's own Bonjour advertisement as a peer.
+                let others = found.filter { !self.isSelf($0) }
+                self.discovered = Dictionary(uniqueKeysWithValues: others.map { ($0.displayName, $0) })
+                onChange(self.mapPeers(others))
             }
         }
         discovery.start()
     }
 
+    /// True when a discovered service is this Mac advertising itself.
+    private func isSelf(_ peer: DiscoveredPeer) -> Bool {
+        peer.displayName == thisMacName
+    }
+
     private func mapPeers(_ found: [DiscoveredPeer]) -> [Peer] {
         found.map { d in
             let trusted = persistentTrust.store.trustedPeers.contains { $0.displayName == d.displayName }
+            // A trusted peer that is currently discovered is reachable
+            // (`available`); a discovered-but-untrusted peer must be paired
+            // first. Peers that leave the network drop out of `found` entirely,
+            // so a stale "available" row can no longer linger.
             return Peer(id: UUID(), displayName: d.displayName,
                         protocolVersion: Constants.protocolVersion,
                         status: trusted ? .available : .untrusted)
@@ -189,7 +200,25 @@ final class AppServices {
         await session.setDelegate(controller)
 
         let coordinator = SwitchCoordinator(bluetooth: bluetooth, peerControl: control)
-        try await coordinator.acquireDevices(devices, fromPeer: trusted.id)
+
+        // Bound the whole handoff (spec §22). Without this, a peer that never
+        // becomes reachable leaves the underlying NWConnection.send awaiting
+        // forever, so the switch spins indefinitely instead of failing.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await coordinator.acquireDevices(devices, fromPeer: trusted.id)
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(Constants.Timeouts.entireSwitch * 1_000_000_000))
+                throw SwitchError.releaseTimedOut
+            }
+            defer { group.cancelAll() }
+            // Surface the first result: either the switch finished, or it timed out.
+            try await group.next()
+        }
+        // Best-effort: tear down the transport so a failed switch does not leak
+        // a half-open connection.
+        await transport.close()
     }
 
     // MARK: Trust
