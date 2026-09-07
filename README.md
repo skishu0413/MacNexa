@@ -192,6 +192,51 @@ MACNEXA_USE_IOBLUETOOTH=1 open -a MacNexa
 #   Environment Variables, set MACNEXA_USE_IOBLUETOOTH = 1
 ```
 
+### Secret storage (Keychain vs. file) — MDM-friendly
+
+MacNexa keeps two long-term secrets: this Mac's Curve25519 **identity private
+key** and its **trusted-peer** records. Where they live depends on the build:
+
+- **Release builds** use the **Keychain** by default (OS-managed encryption at
+  rest). If the Keychain turns out to be unavailable at launch — common on
+  **MDM-managed / locked-down Macs** where policy blocks it — the app probes
+  once and automatically falls back to the file store instead of failing.
+- **Debug builds** default to an **encrypted file store** (no Keychain), so
+  development never triggers the login-keychain password prompt. The Xcode
+  scheme also sets `MACNEXA_NO_KEYCHAIN=1` for the same reason.
+
+To force the file store in any build (e.g. to mirror an MDM Mac):
+
+```bash
+MACNEXA_NO_KEYCHAIN=1 MACNEXA_USE_IOBLUETOOTH=1 open -a MacNexa
+# In Xcode: Edit Scheme… > Run > Arguments > Environment Variables,
+#   set MACNEXA_NO_KEYCHAIN = 1
+```
+
+The file store lives at `~/Library/Application Support/MacNexa/secrets.enc`,
+encrypted with AES-GCM using a per-install key in `secrets.seed` (both `0600`).
+This is weaker than the Keychain because the key sits on disk beside the
+ciphertext — see `Documentation/SECURITY.md` for the full tradeoff.
+
+### Code signing (stops repeated Keychain prompts)
+
+Ad-hoc-signed Debug builds get a **new signature on every rebuild**, which
+invalidates the Keychain access ACL and makes macOS re-prompt for the login
+password on each launch. To sign with a stable local identity instead, create a
+one-time self-signed code-signing certificate (no Apple Developer account
+needed):
+
+```bash
+./scripts/create-signing-cert.sh   # creates the "MacNexa Dev" identity
+xcodegen generate                  # project.yml already references it
+```
+
+`project.yml` signs with `CODE_SIGN_IDENTITY: "MacNexa Dev"` and sets
+`ENABLE_DEBUG_DYLIB: NO` (the debug-dylib split can otherwise cause a dyld
+"different Team IDs" load failure under manual signing). With Debug builds
+defaulting to the file store, signing is only needed if you specifically want
+Keychain-backed storage during development.
+
 ### Two-Mac setup (target workflow)
 
 1. Install and launch MacNexa on **both** Macs (e.g. Mac mini and MacBook Pro).
@@ -227,8 +272,9 @@ Implemented and unit-tested (core) or built (app):
 - **Models & protocol** — device/peer models, versioned message envelope, framing.
 - **Security** — Curve25519 + HKDF, HMAC signing, replay protection, fail-closed
   command validation, trust store, rate limiting, pairing code + key exchange.
-- **Persistence** — identity + trusted-peer storage (Keychain in the app,
-  in-memory for tests).
+- **Persistence** — identity + trusted-peer storage, with a Keychain store, an
+  encrypted file store for MDM-locked Macs (automatic fallback), and an
+  in-memory store for tests.
 - **Networking** — Bonjour discovery, listener, Network.framework transport,
   authenticated peer sessions.
 - **Switching** — full `SwitchCoordinator` (one transaction at a time), state

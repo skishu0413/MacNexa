@@ -29,10 +29,10 @@ final class AppServices {
     var onPendingPairing: (@MainActor (PendingPairing) -> Void)?
     private var pendingConfirms: [UUID: (remote: PairingExchange, session: PeerSession)] = [:]
 
-    init(bluetooth: BluetoothManaging, useKeychain: Bool) throws {
+    init(bluetooth: BluetoothManaging, secrets: SecretStoring) throws {
         self.bluetooth = bluetooth
         self.thisMacName = Host.current().localizedName ?? "This Mac"
-        self.secrets = useKeychain ? KeychainSecretStore() : InMemorySecretStore()
+        self.secrets = secrets
 
         let identityStore = IdentityStore(secrets: secrets)
         self.identity = try identityStore.loadOrCreateIdentity()
