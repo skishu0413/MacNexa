@@ -58,8 +58,26 @@ A command is executed only if all five checks pass.
 
 ## Storage
 
-- Long-term private keys and shared secrets live only in the Keychain.
+- By default, long-term private keys and shared secrets live only in the
+  Keychain (OS-managed, hardware-backed encryption at rest).
 - No secrets are logged (OSLog uses privacy redaction) or advertised via Bonjour.
+
+### Keychain-free fallback (MDM / locked-down Macs)
+
+On managed Macs the Keychain is often blocked by policy, which would otherwise
+prevent the app from persisting its identity or trusted peers at all. For those
+environments there is an encrypted file store (`FileSecretStore`):
+
+- Enable explicitly with `MACNEXA_NO_KEYCHAIN=1`, or the app falls back to it
+  automatically when a Keychain read/write probe fails at launch.
+- Secrets are stored in `~/Library/Application Support/MacNexa/secrets.enc`,
+  encrypted with AES-GCM using a per-install random key in `secrets.seed`. Both
+  files are written atomically with `0600` permissions and file protection.
+- Tradeoff: unlike the Keychain, the encryption key material lives on disk next
+  to the ciphertext, so this is weaker than Keychain storage. It protects
+  against casual disk inspection and accidental exposure, not against an
+  attacker with full read access to the user's home directory. It is used only
+  when the Keychain is unavailable or explicitly opted out.
 
 ## Hardening / platform
 
