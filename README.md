@@ -71,6 +71,12 @@ Prefer Xcode? After `xcodegen generate`, just open the project and press Run
 open MacNexa.xcodeproj
 ```
 
+> Always re-run `xcodegen generate` after cloning **and after every `git pull`
+> that changes `project.yml`**. The `MacNexa.xcodeproj` is generated and not
+> committed, so pulling never updates it. A stale project causes confusing build
+> errors — e.g. `No certificate matching 'MacNexa Dev' found` from an old
+> signing setting. Regenerating fixes them.
+
 ## Installation
 
 MacNexa is currently distributed as source. Build it from a checkout:
