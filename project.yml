@@ -26,18 +26,19 @@ targets:
         SWIFT_VERSION: "5.9"
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
-        # Sign with a stable local self-signed identity ("MacNexa Dev") instead
-        # of a fresh ad-hoc signature on every build. A stable signature keeps
-        # the Keychain access ACL valid across rebuilds, so macOS stops asking
-        # for the login password each launch. Create the identity once with
-        # scripts/create-signing-cert.sh (see README).
-        CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "MacNexa Dev"
-        # The Xcode 15+/26 "debug dylib" split (used for previews) signs the
-        # main executable and MacNexa.debug.dylib separately; with a custom
-        # manual identity their Team IDs can disagree, and dyld then refuses to
-        # load the dylib ("different Team IDs"). Disable the split so Debug
-        # builds produce a single, consistently signed executable.
+        # Ad-hoc signing by default so the project builds on any Mac with no
+        # setup. Debug builds use the encrypted file store (see below), so they
+        # don't touch the Keychain and don't need a stable signature to avoid
+        # the login-keychain prompt. If you specifically want Keychain-backed
+        # storage in Debug without repeated prompts, create the optional
+        # "MacNexa Dev" identity (scripts/create-signing-cert.sh) and set
+        # CODE_SIGN_IDENTITY yourself — it is not required.
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        # Disable the Xcode "debug dylib" split so Debug builds produce a single
+        # executable. The split signs the main binary and MacNexa.debug.dylib
+        # separately, which can trigger a dyld "different Team IDs" load failure
+        # when signing identities differ between them.
         ENABLE_DEBUG_DYLIB: NO
       configs:
         Debug:

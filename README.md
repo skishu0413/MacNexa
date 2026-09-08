@@ -71,6 +71,12 @@ Prefer Xcode? After `xcodegen generate`, just open the project and press Run
 open MacNexa.xcodeproj
 ```
 
+> Always re-run `xcodegen generate` after cloning **and after every `git pull`
+> that changes `project.yml`**. The `MacNexa.xcodeproj` is generated and not
+> committed, so pulling never updates it. A stale project causes confusing build
+> errors — e.g. `No certificate matching 'MacNexa Dev' found` from an old
+> signing setting. Regenerating fixes them.
+
 ## Installation
 
 MacNexa is currently distributed as source. Build it from a checkout:
@@ -218,24 +224,27 @@ encrypted with AES-GCM using a per-install key in `secrets.seed` (both `0600`).
 This is weaker than the Keychain because the key sits on disk beside the
 ciphertext — see `Documentation/SECURITY.md` for the full tradeoff.
 
-### Code signing (stops repeated Keychain prompts)
+### Code signing (optional)
 
-Ad-hoc-signed Debug builds get a **new signature on every rebuild**, which
-invalidates the Keychain access ACL and makes macOS re-prompt for the login
-password on each launch. To sign with a stable local identity instead, create a
-one-time self-signed code-signing certificate (no Apple Developer account
-needed):
+By default the project uses **ad-hoc signing** (`CODE_SIGN_IDENTITY: "-"`), so it
+builds on any Mac with no setup. Because Debug builds use the file store, they
+never touch the Keychain and there is no repeated login-keychain prompt to
+avoid — so no stable signing identity is required.
+
+You only need the optional stable identity if you specifically want
+**Keychain-backed storage during Debug** (ad-hoc signatures change on every
+rebuild, which would otherwise re-prompt for the login password). In that case,
+create a one-time self-signed cert (no Apple Developer account needed) and point
+the build at it yourself:
 
 ```bash
-./scripts/create-signing-cert.sh   # creates the "MacNexa Dev" identity
-xcodegen generate                  # project.yml already references it
+./scripts/create-signing-cert.sh   # creates the local "MacNexa Dev" identity
+# then set CODE_SIGN_IDENTITY: "MacNexa Dev" in project.yml and regenerate
 ```
 
-`project.yml` signs with `CODE_SIGN_IDENTITY: "MacNexa Dev"` and sets
-`ENABLE_DEBUG_DYLIB: NO` (the debug-dylib split can otherwise cause a dyld
-"different Team IDs" load failure under manual signing). With Debug builds
-defaulting to the file store, signing is only needed if you specifically want
-Keychain-backed storage during development.
+Note: that `MacNexa Dev` cert is local to the machine that created it. Do not
+hard-code it in `project.yml` for a shared repo, or other Macs will fail to
+build with "No certificate matching 'MacNexa Dev' found".
 
 ### Two-Mac setup (target workflow)
 
