@@ -32,6 +32,10 @@ USE_MOCK=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --build-only|-b)
+      MODE="build"
+      shift
+      ;;
     --mock|-m)
       USE_MOCK=1
       shift
@@ -49,11 +53,12 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: ./run.sh [options]"
       echo ""
       echo "Options:"
-      echo "  (none)      Build, sign, and launch MacNexa"
-      echo "  --mock, -m  Launch with simulated Bluetooth devices (testing mode)"
-      echo "  --logs, -l  Stream live MacNexa console logs"
-      echo "  --clean, -c Clean build artifacts"
-      echo "  --help, -h  Show this help"
+      echo "  (none)            Build, sign, and launch MacNexa"
+      echo "  --build-only, -b  Compile and package app bundle without launching"
+      echo "  --mock, -m        Launch with simulated Bluetooth devices (testing mode)"
+      echo "  --logs, -l        Stream live MacNexa console logs"
+      echo "  --clean, -c       Clean build artifacts"
+      echo "  --help, -h        Show this help"
       exit 0
       ;;
     *)
@@ -160,6 +165,11 @@ ENTITLEMENTS="$ROOT_DIR/MacNexa/Resources/MacNexa-Debug.entitlements"
 if [[ -f "$ENTITLEMENTS" ]]; then
   log_info "Signing MacNexa with Bluetooth & Local Network entitlements..."
   codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_DIR" >/dev/null 2>&1 || true
+fi
+
+if [[ "$MODE" == "build" ]]; then
+  log_ok "Build and signing complete: $APP_DIR"
+  exit 0
 fi
 
 # ------------------------------------------------------------------------------

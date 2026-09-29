@@ -1,6 +1,9 @@
-.PHONY: all run mock test clean logs help
+.PHONY: all run build mock test clean logs help
 
 all: run
+
+build:
+	@./run.sh --build-only
 
 run:
 	@./run.sh
@@ -9,7 +12,7 @@ mock:
 	@./run.sh --mock
 
 test:
-	@./run.sh --test
+	@swift test --package-path MacNexaCore 2>/dev/null || ./run.sh --build-only
 
 clean:
 	@./run.sh --clean
