@@ -6,12 +6,14 @@ public struct SwitchTransaction: Identifiable, Sendable, Equatable {
     public let id: UUID
     public let destinationPeerId: UUID
     public let deviceIds: [UUID]
+    public let devices: [ManagedDevice]
     public let startedAt: TimeInterval
 
-    public init(id: UUID = UUID(), destinationPeerId: UUID, deviceIds: [UUID], startedAt: TimeInterval) {
+    public init(id: UUID = UUID(), destinationPeerId: UUID, deviceIds: [UUID]? = nil, devices: [ManagedDevice] = [], startedAt: TimeInterval) {
         self.id = id
         self.destinationPeerId = destinationPeerId
-        self.deviceIds = deviceIds
+        self.devices = devices
+        self.deviceIds = deviceIds ?? devices.map(\.id)
         self.startedAt = startedAt
     }
 }

@@ -46,6 +46,7 @@ public actor SwitchCoordinator {
         let transaction = SwitchTransaction(
             destinationPeerId: peerId,
             deviceIds: devices.map(\.id),
+            devices: devices,
             startedAt: clock.now()
         )
         activeTransaction = transaction
@@ -81,6 +82,47 @@ public actor SwitchCoordinator {
             activeTransaction = nil
         } catch {
             await handleFailure(transaction: transaction, connected: connected)
+            throw error
+        }
+    }
+
+    /// Hands off/sends the given devices currently on THIS Mac to the destination peer.
+    public func sendDevices(
+        _ devices: [ManagedDevice],
+        toPeer peerId: UUID
+    ) async throws {
+        guard !machine.isActive else { throw SwitchError.transactionConflict }
+
+        let transaction = SwitchTransaction(
+            destinationPeerId: peerId,
+            deviceIds: devices.map(\.id),
+            devices: devices,
+            startedAt: clock.now()
+        )
+        activeTransaction = transaction
+        machine = SwitchStateMachine()
+
+        do {
+            try machine.apply(.begin)                    // -> preparing
+
+            // 1. Release devices locally so Bluetooth link is free for peer to bond
+            for device in devices {
+                try await bluetooth.disconnect(device)
+            }
+            try machine.apply(.releaseConfirmed)         // -> connectingKeyboard
+
+            // 2. Ask peer to connect/pair
+            try await peerControl.requestConnect(transaction: transaction)
+            try machine.apply(.keyboardConnected)        // -> connectingTrackpad
+            try machine.apply(.trackpadConnected)        // -> verifying
+            try machine.apply(.verified)                 // -> completed
+
+            // 3. Notify complete
+            try await peerControl.notifySwitchComplete(transaction: transaction)
+            try machine.apply(.reset)                    // -> idle
+            activeTransaction = nil
+        } catch {
+            await handleFailure(transaction: transaction, connected: [])
             throw error
         }
     }

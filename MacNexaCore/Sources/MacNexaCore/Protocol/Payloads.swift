@@ -9,7 +9,12 @@ public struct StatusPayload: Codable, Equatable, Sendable {
 /// Payload listing devices involved in a release/connect request.
 public struct DeviceListPayload: Codable, Equatable, Sendable {
     public let deviceIds: [UUID]
-    public init(deviceIds: [UUID]) { self.deviceIds = deviceIds }
+    public let devices: [ManagedDevice]?
+
+    public init(deviceIds: [UUID], devices: [ManagedDevice]? = nil) {
+        self.deviceIds = deviceIds
+        self.devices = devices
+    }
 }
 
 /// Payload for ERROR messages.

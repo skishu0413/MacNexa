@@ -26,5 +26,7 @@
     <string>MacNexa uses the local network to discover and coordinate with your other Macs.</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>MacNexa manages the connection of your Magic Keyboard and Magic Trackpad.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>MacNexa connects to your Magic Keyboard and Magic Trackpad.</string>
 </dict>
 </plist>

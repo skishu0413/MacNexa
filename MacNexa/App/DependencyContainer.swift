@@ -10,9 +10,8 @@ final class DependencyContainer {
 
     init() {
         let env = ProcessInfo.processInfo.environment
-        let useReal = env["MACNEXA_USE_IOBLUETOOTH"] == "1"
-
-        let bt: BluetoothManaging = useReal ? IOBluetoothManager() : MockBluetoothManager()
+        let useMock = env["MACNEXA_USE_MOCK_BLUETOOTH"] == "1"
+        let bt: BluetoothManaging = useMock ? MockBluetoothManager() : IOBluetoothManager()
         self.bluetooth = bt
 
         do {

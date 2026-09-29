@@ -27,7 +27,9 @@ final class AppServices {
     // Active pairing sessions keyed by the transport's session, plus pending UI.
     private var pairingSessions: [UUID: (session: PeerSession, local: PairingSession)] = [:]
     var onPendingPairing: (@MainActor (PendingPairing) -> Void)?
+    var onDevicesChanged: (@MainActor () -> Void)?
     private var pendingConfirms: [UUID: (remote: PairingExchange, session: PeerSession)] = [:]
+    private var activeControl: NetworkPeerControl?
 
     init(bluetooth: BluetoothManaging, secrets: SecretStoring) throws {
         self.bluetooth = bluetooth
@@ -73,10 +75,6 @@ final class AppServices {
     private func mapPeers(_ found: [DiscoveredPeer]) -> [Peer] {
         found.map { d in
             let trusted = persistentTrust.store.trustedPeers.contains { $0.displayName == d.displayName }
-            // A trusted peer that is currently discovered is reachable
-            // (`available`); a discovered-but-untrusted peer must be paired
-            // first. Peers that leave the network drop out of `found` entirely,
-            // so a stale "available" row can no longer linger.
             return Peer(id: UUID(), displayName: d.displayName,
                         protocolVersion: Constants.protocolVersion,
                         status: trusted ? .available : .untrusted)
@@ -96,7 +94,7 @@ final class AppServices {
 
     // MARK: Pairing (spec §14, §38)
 
-    /// Builds a session for a transport that can receive pairing messages.
+    /// Builds a session for a transport that can receive pairing and authenticated messages.
     private func makePairingSession(_ transport: any MessageTransport) -> PeerSession {
         let validator = CommandValidator(
             trustStore: persistentTrust.store,
@@ -108,12 +106,12 @@ final class AppServices {
                            localPeerId: localPeerId, remotePeer: nil, validator: validator)
     }
 
-    /// Handles an inbound connection: set up a pairing-capable session.
+    /// Handles an inbound connection: set up an inbound session for pairing or commands.
     private func acceptInbound(_ transport: NWMessageTransport) {
         let session = makePairingSession(transport)
         let local = PairingSession(localExchange: localPairingExchange())
         pairingSessions[session.id] = (session, local)
-        let delegate = PairingDelegateBox(services: self, session: session, local: local)
+        let delegate = InboundSessionDelegate(services: self, session: session, local: local)
         Task {
             await session.setDelegate(delegate)
             await session.start()
@@ -128,7 +126,7 @@ final class AppServices {
         let session = makePairingSession(transport)
         let local = PairingSession(localExchange: localPairingExchange())
         pairingSessions[session.id] = (session, local)
-        let delegate = PairingDelegateBox(services: self, session: session, local: local)
+        let delegate = InboundSessionDelegate(services: self, session: session, local: local)
         retain(delegate)
         Task {
             await session.setDelegate(delegate)
@@ -139,7 +137,24 @@ final class AppServices {
         }
     }
 
-    /// Called by the delegate box when a pairing message arrives.
+    /// Called when an inbound validated message arrives from a trusted peer.
+    func handleInboundMessage(_ message: NetworkMessage, from peer: TrustedPeer, on session: PeerSession) async {
+        let controller = SessionController(
+            bluetooth: bluetooth,
+            session: session,
+            control: activeControl,
+            knownDevices: { [bluetooth] in (try? await bluetooth.devices()) ?? [] }
+        )
+        controller.onSwitchCompleted = { [weak self] in
+            Task { @MainActor in
+                self?.onDevicesChanged?()
+            }
+        }
+        retain(controller)
+        await controller.session(session, didReceive: message, from: peer)
+    }
+
+    /// Called by the delegate when a pairing message arrives.
     func handlePairing(_ message: PairingMessage, session: PeerSession, local: PairingSession) {
         switch message {
         case let .hello(remote, remoteNonce):
@@ -155,8 +170,8 @@ final class AppServices {
     private func surfaceConfirmation(remote: PairingExchange, remoteNonce: Data,
                                      local: PairingSession, session: PeerSession) {
         let code = local.verificationCode(withRemote: remote, remoteNonce: remoteNonce)
-        pendingConfirms[session.id] = (remote, session)
         let pending = PendingPairing(peerName: remote.displayName, code: code, remote: remote)
+        pendingConfirms[pending.id] = (remote, session)
         onPendingPairing?(pending)
     }
 
@@ -192,8 +207,9 @@ final class AppServices {
         await session.start()
 
         let control = NetworkPeerControl(session: session)
-        // Route inbound confirmations (DEVICES_RELEASED/CONNECTED) to the control
-        // so the coordinator's awaits resolve.
+        self.activeControl = control
+        defer { self.activeControl = nil }
+
         let controller = SessionController(bluetooth: bluetooth, session: session, control: control,
                                            knownDevices: { [bluetooth] in (try? await bluetooth.devices()) ?? [] })
         retain(controller)
@@ -201,23 +217,31 @@ final class AppServices {
 
         let coordinator = SwitchCoordinator(bluetooth: bluetooth, peerControl: control)
 
-        // Bound the whole handoff (spec §22). Without this, a peer that never
-        // becomes reachable leaves the underlying NWConnection.send awaiting
-        // forever, so the switch spins indefinitely instead of failing.
+        // Check whether THIS Mac currently has devices connected:
+        var localConnected: [ManagedDevice] = []
+        for dev in devices {
+            if await bluetooth.connectionState(for: dev) == .connected {
+                localConnected.append(dev)
+            }
+        }
+
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
-                try await coordinator.acquireDevices(devices, fromPeer: trusted.id)
+                if !localConnected.isEmpty {
+                    // PUSH: Hand off devices currently on THIS Mac to peer
+                    try await coordinator.sendDevices(localConnected, toPeer: trusted.id)
+                } else {
+                    // PULL: Acquire devices from peer to THIS Mac
+                    try await coordinator.acquireDevices(devices, fromPeer: trusted.id)
+                }
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(Constants.Timeouts.entireSwitch * 1_000_000_000))
                 throw SwitchError.releaseTimedOut
             }
             defer { group.cancelAll() }
-            // Surface the first result: either the switch finished, or it timed out.
             try await group.next()
         }
-        // Best-effort: tear down the transport so a failed switch does not leak
-        // a half-open connection.
         await transport.close()
     }
 
@@ -236,15 +260,14 @@ final class AppServices {
     func setLaunchAtLogin(_ enabled: Bool) { LaunchAtLogin.setEnabled(enabled) }
 
     // Keep delegate boxes alive for the life of their session.
-    private var retainedDelegates: [PairingDelegateBox] = []
+    private var retainedDelegates: [InboundSessionDelegate] = []
     private var retainedControllers: [SessionController] = []
-    private func retain(_ box: PairingDelegateBox) { retainedDelegates.append(box) }
+    private func retain(_ box: InboundSessionDelegate) { retainedDelegates.append(box) }
     private func retain(_ controller: SessionController) { retainedControllers.append(controller) }
 }
 
-/// Bridges the Sendable PeerSessionDelegate callbacks back to the main-actor
-/// AppServices for pairing handling.
-final class PairingDelegateBox: PeerSessionDelegate, @unchecked Sendable {
+/// Bridges the Sendable PeerSessionDelegate callbacks back to AppServices for pairing and command routing.
+final class InboundSessionDelegate: PeerSessionDelegate, @unchecked Sendable {
     private weak var services: AppServices?
     private let session: PeerSession
     private let local: PairingSession
@@ -256,7 +279,7 @@ final class PairingDelegateBox: PeerSessionDelegate, @unchecked Sendable {
     }
 
     func session(_ session: PeerSession, didReceive message: NetworkMessage, from peer: TrustedPeer) async {
-        // Command routing during an established session is handled elsewhere.
+        await services?.handleInboundMessage(message, from: peer, on: session)
     }
 
     func session(_ session: PeerSession, didReceivePairing message: PairingMessage) async {

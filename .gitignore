@@ -25,6 +25,7 @@ MacNexa.xcodeproj/
 
 # Probe tool build
 Tools/**/.build/
+Tools/.bin/
 
 # Editor settings
 .vscode/

@@ -19,7 +19,7 @@ public actor NetworkPeerControl: PeerControlling {
     }
 
     public func requestRelease(transaction: SwitchTransaction) async throws {
-        let payload = try JSONEncoder().encode(DeviceListPayload(deviceIds: transaction.deviceIds))
+        let payload = try JSONEncoder().encode(DeviceListPayload(deviceIds: transaction.deviceIds, devices: transaction.devices))
         try await session.send(type: .releaseDevices, payload: payload, transactionId: transaction.id)
         try await waitRelease(transaction.id,
                                     timeout: Constants.Timeouts.deviceRelease,
@@ -35,10 +35,19 @@ public actor NetworkPeerControl: PeerControlling {
     }
 
     public func requestReconnect(transaction: SwitchTransaction) async throws {
-        try await session.send(type: .connectDevices, transactionId: transaction.id)
+        let payload = try JSONEncoder().encode(DeviceListPayload(deviceIds: transaction.deviceIds, devices: transaction.devices))
+        try await session.send(type: .connectDevices, payload: payload, transactionId: transaction.id)
         try await waitReconnect(transaction.id,
                                 timeout: Constants.Timeouts.deviceConnection,
                                 timeoutError: SwitchError.rollbackFailed)
+    }
+
+    public func requestConnect(transaction: SwitchTransaction) async throws {
+        let payload = try JSONEncoder().encode(DeviceListPayload(deviceIds: transaction.deviceIds, devices: transaction.devices))
+        try await session.send(type: .connectDevices, payload: payload, transactionId: transaction.id)
+        try await waitReconnect(transaction.id,
+                                timeout: Constants.Timeouts.deviceConnection,
+                                timeoutError: SwitchError.keyboardConnectionFailed)
     }
 
     /// Called by the session delegate when a confirmation message arrives.

@@ -35,7 +35,7 @@ public actor PeerSession {
     private let decoder = FrameDecoder()
 
     /// The remote peer's identity, known once trusted. Used to sign outbound.
-    private let remotePeer: TrustedPeer?
+    private var remotePeer: TrustedPeer?
 
     public weak var delegate: PeerSessionDelegate?
 
@@ -60,6 +60,10 @@ public actor PeerSession {
 
     public func setDelegate(_ delegate: PeerSessionDelegate?) {
         self.delegate = delegate
+    }
+
+    public func setRemotePeer(_ peer: TrustedPeer) {
+        self.remotePeer = peer
     }
 
     /// Begins receiving. Must be called once after construction.
@@ -136,6 +140,9 @@ public actor PeerSession {
             }
 
             let peer = try validator.validate(message)   // fail-closed gate
+            if self.remotePeer == nil {
+                self.remotePeer = peer
+            }
             await delegate?.session(self, didReceive: message, from: peer)
         } catch let error as ProtocolError {
             lastValidationError = error   // dropped, never delivered

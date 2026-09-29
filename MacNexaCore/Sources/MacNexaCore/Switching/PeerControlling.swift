@@ -13,4 +13,12 @@ public protocol PeerControlling: Sendable {
     /// Ask the peer to reconnect the devices (used during rollback when THIS Mac
     /// was the source that already released them). No-op for pure destination.
     func requestReconnect(transaction: SwitchTransaction) async throws
+    /// Ask the peer to connect to the specified devices, waiting for its confirmation.
+    func requestConnect(transaction: SwitchTransaction) async throws
+}
+
+public extension PeerControlling {
+    func requestConnect(transaction: SwitchTransaction) async throws {
+        try await requestReconnect(transaction: transaction)
+    }
 }

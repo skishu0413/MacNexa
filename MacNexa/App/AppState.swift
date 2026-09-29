@@ -27,6 +27,14 @@ final class AppState: ObservableObject {
         self.launchAtLogin = services.isLaunchAtLoginEnabled
         services.onPendingPairing = { [weak self] pending in
             self?.pendingPairing = pending
+            PairingAlertPresenter.shared.show(
+                pending: pending,
+                onConfirm: { self?.confirmPairing() },
+                onCancel: { self?.cancelPairing() }
+            )
+        }
+        services.onDevicesChanged = { [weak self] in
+            Task { await self?.refreshDevices() }
         }
     }
 
