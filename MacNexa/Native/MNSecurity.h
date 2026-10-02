@@ -109,6 +109,18 @@ typedef NS_ERROR_ENUM(MNStorageErrorDomain, MNStorageErrorCode) {
 // SAS (Short Authentication String) Calculation
 - (NSString *)computeSASFromSecret:(NSData *)secret peerA:(NSString *)peerA peerB:(NSString *)peerB;
 
+// Pairing Confirmation Authentication (HMAC-SHA256 authenticated confirmation)
+- (NSData *)computePairingConfirmationTagWithSecret:(NSData *)secret
+                                               role:(NSString *)role
+                                       senderPeerId:(NSString *)senderPeerId
+                                     receiverPeerId:(NSString *)receiverPeerId;
+
+- (BOOL)verifyPairingConfirmationTag:(NSData *)tag
+                          withSecret:(NSData *)secret
+                                role:(NSString *)role
+                        senderPeerId:(NSString *)senderPeerId
+                      receiverPeerId:(NSString *)receiverPeerId;
+
 // Nonce Generation & Replay Protection (with cross-restart persistence)
 - (uint64_t)nextOutgoingNonce;
 - (BOOL)checkAndCommitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;

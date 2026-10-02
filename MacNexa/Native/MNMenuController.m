@@ -374,9 +374,9 @@
         [NSApp activateIgnoringOtherApps:YES];
 
         NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = [NSString stringWithFormat:@"MacNexa Security Verification"];
+        alert.messageText = @"MacNexa Security Verification";
         alert.informativeText = [NSString stringWithFormat:
-            @"Pairing request received from: %@\n\n"
+            @"Pairing verification for: %@\n\n"
             @"Do the 6 digits match on both screens?\n\n"
             @"       [  %@  ]\n\n"
             @"Click Confirm to establish a secure, encrypted trust relationship.",

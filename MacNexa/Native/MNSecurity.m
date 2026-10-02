@@ -763,6 +763,36 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
     return [NSString stringWithFormat:@"%03u %03u", code / 1000, code % 1000];
 }
 
+#pragma mark - Pairing Confirmation Authentication
+
+- (NSData *)computePairingConfirmationTagWithSecret:(NSData *)secret
+                                               role:(NSString *)role
+                                       senderPeerId:(NSString *)senderPeerId
+                                     receiverPeerId:(NSString *)receiverPeerId {
+    if (!secret || secret.length == 0 || !role || !senderPeerId || !receiverPeerId) {
+        return [NSData data];
+    }
+    NSString *context = [NSString stringWithFormat:@"MacNexa-Pair-Confirm-v1:%@:%@:%@", role, senderPeerId, receiverPeerId];
+    unsigned char tag[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, secret.bytes, secret.length, [context UTF8String], [context length], tag);
+    return [NSData dataWithBytes:tag length:CC_SHA256_DIGEST_LENGTH];
+}
+
+- (BOOL)verifyPairingConfirmationTag:(NSData *)tag
+                          withSecret:(NSData *)secret
+                                role:(NSString *)role
+                        senderPeerId:(NSString *)senderPeerId
+                      receiverPeerId:(NSString *)receiverPeerId {
+    if (!tag || tag.length != CC_SHA256_DIGEST_LENGTH || !secret || secret.length == 0) {
+        return NO;
+    }
+    NSData *expected = [self computePairingConfirmationTagWithSecret:secret
+                                                                role:role
+                                                        senderPeerId:senderPeerId
+                                                      receiverPeerId:receiverPeerId];
+    return timingsafe_bcmp(tag.bytes, expected.bytes, CC_SHA256_DIGEST_LENGTH) == 0;
+}
+
 #pragma mark - Nonce & Replay Protection
 
 - (uint64_t)nextOutgoingNonce {

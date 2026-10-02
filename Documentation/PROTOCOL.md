@@ -25,30 +25,73 @@ MacNexa utilizes a binary-framed, encrypted TCP protocol over the local network 
 
 - **Bounds Enforcement**:
   - Maximum Frame Length (`kMNMaxFrameSize`): **65,536 bytes (64 KB)**.
-  - Sockets enforce a **3-second timeout** (`SO_RCVTIMEO`, `SO_SNDTIMEO`) to prevent connection starvation.
+  - Sockets enforce a **5-second timeout** (`SO_RCVTIMEO`, `SO_SNDTIMEO`) for automated machine requests, and an extended **60-second timeout** during human-in-the-loop SAS pairing code verification.
 
 ---
 
-## 2. Message Formats
+## 2. Pairing Sequence & Message Formats
 
-### 2.1. Pairing Request (`pairRequest`)
-Initiated by Mac A to request mutual authentication with Mac B.
+MacNexa enforces a strict **Exchange First, Verify Concurrently, Confirm Authenticated** pairing handshake:
+
+```
+ Initiator (Mac A)                                              Receiver (Mac B)
+         |                                                              |
+         | ---- 1. pairKeyExchange (A's PubKey, peerId, peerName) ----> |
+         | <--- 2. pairKeyExchangeResponse (B's PubKey, accepted:true) - |
+         |                                                              |
+         | [Both derive shared secret & compute identical 6-digit SAS]  |
+         | [Both display 6-digit code on screen for user comparison]    |
+         |                                                              |
+         | ---- 3. pairConfirm (A accepted, HMAC-SHA256 AuthTag) -----> |
+         |                                         [B verifies A's tag] |
+         |                                       [B waits for user OK]  |
+         |                                          [B persists trust]  |
+         | <--- 4. pairConfirmResponse (B accepted, AuthTag) ---------- |
+         |                                                              |
+[A verifies B's tag]                                                    |
+[A persists trust]                                                      |
+```
+
+### 2.1. Pairing Key Exchange (`pairKeyExchange`)
+Initiated by Mac A to exchange ephemeral ECDH (P-256) public keys.
 ```json
 {
-  "action": "pairRequest",
+  "action": "pairKeyExchange",
   "peerId": "D7DE7B59-3B2B-439A-A42B-6338A6D2313C",
   "peerName": "MacBook Pro",
   "pubKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
 }
 ```
 
-### 2.2. Pairing Response (`pairResponse`)
-Returned by Mac B upon verifying and accepting the pairing request.
+### 2.2. Pairing Key Exchange Response (`pairKeyExchangeResponse`)
+Returned immediately by Mac B with its own ephemeral ECDH public key, allowing both sides to derive the shared secret and display the 6-digit SAS code concurrently.
 ```json
 {
-  "action": "pairResponse",
+  "action": "pairKeyExchangeResponse",
   "accepted": true,
+  "peerId": "8F91B012-4C1A-48B8-9366-21D6385419AA",
+  "peerName": "Mac Studio",
   "pubKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+}
+```
+
+### 2.3. Initiator Authenticated Confirmation (`pairConfirm`)
+Sent by Mac A after its user verifies the 6-digit SAS code and clicks "Confirm & Trust". Authenticated using `HMAC-SHA256(sharedSecret, "MacNexa-Pair-Confirm-v1:initiator:peerA:peerB")`:
+```json
+{
+  "action": "pairConfirm",
+  "accepted": true,
+  "authTag": "f9e2b1...=="
+}
+```
+
+### 2.4. Receiver Authenticated Confirmation Response (`pairConfirmResponse`)
+Returned by Mac B after verifying Mac A's confirmation tag and obtaining local user confirmation. Mac B persists trust before replying; Mac A persists trust upon verifying Mac B's tag:
+```json
+{
+  "action": "pairConfirmResponse",
+  "accepted": true,
+  "authTag": "a8c3d4...=="
 }
 ```
 

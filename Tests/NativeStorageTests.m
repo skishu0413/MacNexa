@@ -268,13 +268,86 @@ int main(int argc, const char * argv[]) {
         ASSERT_TRUE([decrypted3[@"action"] isEqualToString:@"connectAccessory"], "Command 3 action must match");
 
         // -------------------------------------------------------------
-        // Test 6: Cleanup
+        // Test 6: Mutual Pairing Sequence & Authenticated Confirmation Tags
         // -------------------------------------------------------------
-        printf("  [6/6] Cleaning up test sandbox...\n");
+        printf("  [6/7] Testing repaired pairing sequence & authenticated confirmation tags...\n");
+        NSString *macAId = [NSString stringWithFormat:@"mac-a-%u", arc4random()];
+        NSString *macBId = [NSString stringWithFormat:@"mac-b-%u", arc4random()];
+
+        MNSecurity *securityA = [[MNSecurity alloc] initWithSecretStore:store localPeerId:macAId];
+        MNSecurity *securityB = [[MNSecurity alloc] initWithSecretStore:store localPeerId:macBId];
+
+        // 1. Ephemeral ECDH Key Exchange FIRST
+        MNEphemeralKeyPair *pairA = [securityA generateEphemeralKeyPair];
+        MNEphemeralKeyPair *pairB = [securityB generateEphemeralKeyPair];
+        ASSERT_TRUE(pairA != nil && pairB != nil, "Ephemeral key generation must succeed on both peers");
+
+        // Both derive shared secret from the exchanged public keys
+        NSData *secretA = [securityA deriveSharedSecretWithPrivateKey:pairA.privateKey remotePublicKeyData:pairB.publicKeyData];
+        NSData *secretB = [securityB deriveSharedSecretWithPrivateKey:pairB.privateKey remotePublicKeyData:pairA.publicKeyData];
+        ASSERT_TRUE(secretA != nil && secretB != nil, "Both peers must derive shared secrets");
+        ASSERT_TRUE([secretA isEqualToData:secretB], "Derived shared secrets must be cryptographically identical");
+
+        // 2. Both peers compute and display identical SAS codes concurrently
+        NSString *sasA = [securityA computeSASFromSecret:secretA peerA:macAId peerB:macBId];
+        NSString *sasB = [securityB computeSASFromSecret:secretB peerA:macBId peerB:macAId];
+        ASSERT_TRUE([sasA isEqualToString:sasB], "SAS codes displayed on both screens must be identical");
+        ASSERT_TRUE(sasA.length == 7, "SAS code must be 6 digits separated by space");
+
+        // At this stage, BEFORE confirmations, NEITHER peer must be trusted
+        ASSERT_TRUE(![securityA isPeerTrusted:macBId], "Mac B must NOT be trusted before confirmations succeed");
+        ASSERT_TRUE(![securityB isPeerTrusted:macAId], "Mac A must NOT be trusted before confirmations succeed");
+
+        // 3. Test Authenticated Confirmation Tags
+        NSData *initTag = [securityA computePairingConfirmationTagWithSecret:secretA role:@"initiator" senderPeerId:macAId receiverPeerId:macBId];
+        NSData *recvTag = [securityB computePairingConfirmationTagWithSecret:secretB role:@"receiver" senderPeerId:macBId receiverPeerId:macAId];
+        ASSERT_TRUE(initTag.length == 32 && recvTag.length == 32, "Confirmation tags must be 32-byte HMAC-SHA256 digests");
+
+        // Verification of genuine tags
+        BOOL initVerified = [securityB verifyPairingConfirmationTag:initTag withSecret:secretB role:@"initiator" senderPeerId:macAId receiverPeerId:macBId];
+        ASSERT_TRUE(initVerified, "Receiver must verify initiator's genuine confirmation tag");
+
+        BOOL recvVerified = [securityA verifyPairingConfirmationTag:recvTag withSecret:secretA role:@"receiver" senderPeerId:macBId receiverPeerId:macAId];
+        ASSERT_TRUE(recvVerified, "Initiator must verify receiver's genuine confirmation tag");
+
+        // Attack scenario 1: Role swap (e.g. attacker sends receiver tag as initiator tag)
+        BOOL roleSwapRejected = [securityB verifyPairingConfirmationTag:recvTag withSecret:secretB role:@"initiator" senderPeerId:macAId receiverPeerId:macBId];
+        ASSERT_TRUE(!roleSwapRejected, "Role-swapped tag must be rejected");
+
+        // Attack scenario 2: Tampered confirmation tag byte
+        NSMutableData *tamperedTag = [initTag mutableCopy];
+        unsigned char *bytes = (unsigned char *)tamperedTag.mutableBytes;
+        bytes[0] ^= 0xFF;
+        BOOL tamperedRejected = [securityB verifyPairingConfirmationTag:tamperedTag withSecret:secretB role:@"initiator" senderPeerId:macAId receiverPeerId:macBId];
+        ASSERT_TRUE(!tamperedRejected, "Tampered confirmation tag must be rejected");
+
+        // Attack scenario 3: Wrong secret
+        NSData *wrongSecret = [@"WrongCryptographicSecret32Bytes!" dataUsingEncoding:NSUTF8StringEncoding];
+        BOOL wrongSecretRejected = [securityB verifyPairingConfirmationTag:initTag withSecret:wrongSecret role:@"initiator" senderPeerId:macAId receiverPeerId:macBId];
+        ASSERT_TRUE(!wrongSecretRejected, "Tag verified with wrong secret must be rejected");
+
+        // 4. Persistence of Trust ONLY after confirmations succeed
+        // Receiver persists trust upon verifying Initiator
+        BOOL bSaved = [securityB saveTrustedPeerId:macAId name:@"Mac A" secret:secretB error:nil];
+        ASSERT_TRUE(bSaved, "Receiver must save trusted peer after verification");
+
+        // Initiator persists trust upon verifying Receiver
+        BOOL aSaved = [securityA saveTrustedPeerId:macBId name:@"Mac B" secret:secretA error:nil];
+        ASSERT_TRUE(aSaved, "Initiator must save trusted peer after verification");
+
+        ASSERT_TRUE([securityA isPeerTrusted:macBId], "Mac B must now be trusted on Mac A");
+        ASSERT_TRUE([securityB isPeerTrusted:macAId], "Mac A must now be trusted on Mac B");
+
+        // -------------------------------------------------------------
+        // Test 7: Cleanup
+        // -------------------------------------------------------------
+        printf("  [7/7] Cleaning up test sandbox...\n");
         [receiverMac resetReplayHistory];
+        [securityA resetReplayHistory];
+        [securityB resetReplayHistory];
         [fm removeItemAtPath:tmpDir error:nil];
 
-        printf("✅ All 6 test suites PASSED successfully!\n");
+        printf("✅ All 7 test suites PASSED successfully!\n");
     }
     return 0;
 }
