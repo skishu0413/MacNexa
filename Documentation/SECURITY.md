@@ -25,6 +25,7 @@ We assume an adversary with the following capabilities:
 | **Cleartext Sniffing** | Capture shared secrets or monitor device MAC addresses. | **Zero Key Transmission + Full AES-256 Payload Encryption** | Diffie-Hellman Key Exchange (ECDH P-256) + AES-256-PKCS7. |
 | **Man-in-the-Middle (MitM)** | Intercept pairing handshake and inject rogue keys. | **Short Authentication String (SAS)** | 6-digit numeric SAS code visually confirmed by user on both screens. |
 | **Replay Attacks** | Replay valid switch packets hours later to hijack peripherals. | **Monotonic Sequence Nonces + Timestamp Skew Windows** | Strict nonces ($\text{nonce} > \text{lastSeen}$) + 30-second timestamp drift limit. |
+| **Nonce Poisoning / Replay DoS** | Send unauthenticated envelopes with huge nonces to block legitimate traffic. | **Post-Authentication Nonce Commit** | Nonce state mutated strictly after constant-time HMAC-SHA256 verification passes. |
 | **Payload Tampering** | Modify destination device list or inject arbitrary actions. | **Encrypt-then-MAC (EtM)** | HMAC-SHA256 signature calculated over (IV $\parallel$ Ciphertext $\parallel$ Nonce $\parallel$ Timestamp $\parallel$ SenderID). |
 | **Timing Side-Channels** | Infer keys via byte-by-byte comparison timing differences. | **Constant-Time Memory Comparison** | Darwin kernel-grade `timingsafe_bcmp`. |
 | **Local Key Extraction** | Read stored pairing credentials from plaintext plists. | **Injected FileSecretStore (AES-256 + HMAC)** | Atomic writes, 0600 file permissions, 0700 directory permissions, per-install seed. |
@@ -51,18 +52,20 @@ Master shared secrets are **never transmitted over the network**. When two Macs 
 7. Both users visually verify the 6-digit code on their respective screens. If a MitM attacker intervened, the derived keys diverge and the codes will not match.
 8. Upon user confirmation, $K$ is saved into the injected **File Secret Store** (`MNFileSecretStore`).
 
-### 3.2. Authenticated Encryption (Encrypt-then-MAC)
-All operational commands (e.g. `requestSwitch`, device handoff payloads) are protected using Encrypt-then-MAC (EtM):
+### 3.2. Authenticated Encryption & Inbound Verification Sequence (EtM)
+All operational commands (e.g. `requestSwitch`, device handoff payloads) follow a strict, fail-closed verification sequence to prevent both payload tampering and state-poisoning DoS attacks:
 
 1. **Subkey Derivation**:
    - $K_{\text{enc}} = \text{HMAC-SHA256}(K, \text{"macnexa-enc"})$
    - $K_{\text{mac}} = \text{HMAC-SHA256}(K, \text{"macnexa-mac"})$
 2. **IV Generation**: A 16-byte cryptographically secure pseudorandom IV is generated via `arc4random_buf`.
-3. **Encryption**: Plaintext JSON is encrypted with AES-256:
+3. **Outbound Encryption**: Plaintext JSON is encrypted with AES-256:
    $$C = \text{AES-256-PKCS7}(K_{\text{enc}}, \text{IV}, \text{Plaintext})$$
-4. **MAC Tag**:
    $$\text{Tag} = \text{HMAC-SHA256}(K_{\text{mac}}, \text{IV} \parallel C \parallel \text{Nonce} \parallel \text{Timestamp} \parallel \text{SenderID})$$
-5. **Constant-Time Verification**: The receiving Mac verifies $\text{Tag}$ in fixed time via `timingsafe_bcmp`. Any tampering or corruption causes immediate rejection before decryption.
+4. **Inbound Replay Pre-Check (Read-Only)**: The receiving Mac verifies timestamp freshness ($|\text{now} - \text{timestamp}| \le 30\text{s}$) and monotonic nonce freshness ($\text{nonce} > \text{lastSeen}$). **Crucially, the nonce state is NOT mutated yet.**
+5. **Constant-Time Verification**: The receiving Mac calculates expected $\text{Tag}$ and verifies it via `timingsafe_bcmp`. Any tampering or forgery causes immediate rejection before state update or decryption.
+6. **Post-Authentication Nonce Commit**: Only after HMAC verification succeeds is the new nonce recorded in `lastSeenNonces[peerID] = nonce`. Unauthenticated network attackers sending envelopes with huge nonces cannot poison peer state or cause DoS.
+7. **Inbound Decryption**: Once authenticated, the plaintext payload is decrypted via AES-256-CBC.
 
 ---
 

@@ -747,12 +747,34 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     return n;
 }
 
-- (BOOL)validateIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
+- (BOOL)isIncomingNonceValid:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
     if (!peerId) return NO;
     [self.securityLock lock];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 
     // Strict 30-second window to prevent replaying captured frames
+    if (fabs(now - timestamp) > 30.0) {
+        [self.securityLock unlock];
+        return NO;
+    }
+
+    // Nonce must strictly increase monotonically (read-only verification, NO state mutation)
+    NSNumber *last = self.lastSeenNonces[peerId];
+    if (last && nonce <= [last unsignedLongLongValue]) {
+        [self.securityLock unlock];
+        return NO;
+    }
+
+    [self.securityLock unlock];
+    return YES;
+}
+
+- (BOOL)commitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
+    if (!peerId) return NO;
+    [self.securityLock lock];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    // Re-verify timestamp window under lock
     if (fabs(now - timestamp) > 30.0) {
         [self.securityLock unlock];
         return NO;
@@ -765,9 +787,15 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
         return NO;
     }
 
+    // State mutation ONLY occurs after message authenticity has been verified
     self.lastSeenNonces[peerId] = @(nonce);
     [self.securityLock unlock];
     return YES;
+}
+
+- (BOOL)validateIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
+    // Convenience: validate and commit in one step
+    return [self commitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId];
 }
 
 #pragma mark - Authenticated Encryption (AES-256 + HMAC-SHA256 Encrypt-then-MAC)
@@ -854,8 +882,9 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 
     if (ivData.length != 16 || tagData.length != CC_SHA256_DIGEST_LENGTH || cipherData.length == 0) return nil;
 
-    // 1. Replay & Timestamp Check
-    if (![self validateIncomingNonce:nonce timestamp:timestamp fromPeer:peerId]) {
+    // 1. Replay & Timestamp Pre-Check (Read-only verification; DO NOT mutate state yet!)
+    // An unauthenticated attacker sending forged envelopes with huge nonces will not poison replay state.
+    if (![self isIncomingNonceValid:nonce timestamp:timestamp fromPeer:peerId]) {
         return nil;
     }
 
@@ -865,7 +894,7 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     CCHmac(kCCHmacAlgSHA256, masterSecret.bytes, masterSecret.length, "macnexa-enc", 11, k_enc);
     CCHmac(kCCHmacAlgSHA256, masterSecret.bytes, masterSecret.length, "macnexa-mac", 11, k_mac);
 
-    // 3. Constant-Time HMAC-SHA256 Tag Verification
+    // 3. Constant-Time HMAC-SHA256 Tag Verification (Authenticity & Integrity Check)
     NSMutableData *macInput = [NSMutableData dataWithData:ivData];
     [macInput appendData:cipherData];
     uint64_t bigNonce = CFSwapInt64HostToBig(nonce);
@@ -879,10 +908,15 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 
     // Constant-time check prevents timing attacks
     if (timingsafe_bcmp(tagData.bytes, expectedTag, CC_SHA256_DIGEST_LENGTH) != 0) {
-        return nil; // Tampering detected!
+        return nil; // Tampering or forgery detected! Nonce state is untouched.
     }
 
-    // 4. Decrypt AES-256 Ciphertext
+    // 4. Commit Nonce ONLY AFTER HMAC Authentication is Verified
+    if (![self commitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId]) {
+        return nil;
+    }
+
+    // 5. Decrypt AES-256 Ciphertext
     NSMutableData *plainData = [NSMutableData dataWithLength:cipherData.length];
     size_t numBytesDecrypted = 0;
     CCCryptorStatus status = CCCrypt(

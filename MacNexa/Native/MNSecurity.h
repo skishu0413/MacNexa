@@ -109,6 +109,8 @@ typedef NS_ERROR_ENUM(MNStorageErrorDomain, MNStorageErrorCode) {
 
 // Nonce Generation & Replay Protection
 - (uint64_t)nextOutgoingNonce;
+- (BOOL)isIncomingNonceValid:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;
+- (BOOL)commitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;
 - (BOOL)validateIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;
 
 // Authenticated Encryption (AES-256 + HMAC-SHA256 Encrypt-then-MAC)

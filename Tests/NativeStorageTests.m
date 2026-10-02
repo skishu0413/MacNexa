@@ -195,12 +195,64 @@ int main(int argc, const char * argv[]) {
         ASSERT_TRUE(security.lastStorageError != nil, "lastStorageError must be recorded on remove failure");
 
         // -------------------------------------------------------------
-        // Test 5: Cleanup
+        // Test 5: Replay Protection & DoS Resistance (Unauthenticated Nonce Tampering)
         // -------------------------------------------------------------
-        printf("  [5/5] Cleaning up test sandbox...\n");
+        printf("  [5/6] Testing replay protection immunity against unauthenticated nonce DoS...\n");
+        // Set up two communicating peers: senderMac and receiverMac sharing a secret
+        NSData *sharedKey = [@"32ByteCryptographicSharedSecret!" dataUsingEncoding:NSUTF8StringEncoding];
+
+        MNSecurity *receiverMac = [[MNSecurity alloc] initWithSecretStore:store];
+        MNSecurity *senderMac = [[MNSecurity alloc] initWithSecretStore:store];
+
+        // Receiver trusts senderMac.localPeerId
+        NSString *senderId = senderMac.localPeerId;
+        BOOL savedPeer = [receiverMac saveTrustedPeerId:senderId name:@"Sender Mac" secret:sharedKey error:nil];
+        ASSERT_TRUE(savedPeer, "Receiver must trust sender");
+
+        // Sender trusts receiverMac.localPeerId
+        [senderMac saveTrustedPeerId:receiverMac.localPeerId name:@"Receiver Mac" secret:sharedKey error:nil];
+
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        NSDictionary *legitCmd1 = @{ @"action": @"switchAccessory", @"target": @"keyboard" };
+        NSDictionary *legitEnvelope1 = [senderMac encryptDictionary:legitCmd1 forPeerId:receiverMac.localPeerId nonce:1000 timestamp:now];
+        ASSERT_TRUE(legitEnvelope1 != nil, "legitEnvelope1 encryption should succeed");
+
+        // 1. Decrypt legit envelope 1 (nonce = 1000)
+        NSDictionary *decrypted1 = [receiverMac decryptAndVerifyDictionary:legitEnvelope1 fromPeerId:senderId];
+        ASSERT_TRUE(decrypted1 != nil, "Legitimate envelope 1 should decrypt");
+        ASSERT_TRUE([decrypted1[@"action"] isEqualToString:@"switchAccessory"], "Action must match");
+
+        // 2. Replay attack: Replaying legit envelope 1 must be rejected
+        NSDictionary *replayed = [receiverMac decryptAndVerifyDictionary:legitEnvelope1 fromPeerId:senderId];
+        ASSERT_TRUE(replayed == nil, "Replayed envelope must be rejected by monotonic nonce check");
+
+        // 3. Forged attack: Attacker crafts forged envelope with massive nonce (e.g. 999999999) and bad tag
+        NSMutableDictionary *forgedEnvelope = [legitEnvelope1 mutableCopy];
+        forgedEnvelope[@"nonce"] = @(999999999ULL);
+        forgedEnvelope[@"tag"] = @"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+        NSDictionary *attackResult = [receiverMac decryptAndVerifyDictionary:forgedEnvelope fromPeerId:senderId];
+        ASSERT_TRUE(attackResult == nil, "Forged attack envelope must fail HMAC authentication");
+
+        // 4. Crucial test: Legitimate peer sends next command with nonce 1001.
+        // In the vulnerable code, the forged packet's nonce (999999999) was committed before HMAC verification,
+        // which caused nonce 1001 to be rejected (DoS).
+        // With the fix, nonce 1001 MUST be accepted!
+        NSDictionary *legitCmd2 = @{ @"action": @"releaseAccessory", @"target": @"trackpad" };
+        NSDictionary *legitEnvelope2 = [senderMac encryptDictionary:legitCmd2 forPeerId:receiverMac.localPeerId nonce:1001 timestamp:now];
+        ASSERT_TRUE(legitEnvelope2 != nil, "legitEnvelope2 encryption should succeed");
+
+        NSDictionary *decrypted2 = [receiverMac decryptAndVerifyDictionary:legitEnvelope2 fromPeerId:senderId];
+        ASSERT_TRUE(decrypted2 != nil, "Legitimate command with nonce 1001 MUST succeed despite prior attack packet!");
+        ASSERT_TRUE([decrypted2[@"action"] isEqualToString:@"releaseAccessory"], "Command 2 action must match");
+
+        // -------------------------------------------------------------
+        // Test 6: Cleanup
+        // -------------------------------------------------------------
+        printf("  [6/6] Cleaning up test sandbox...\n");
         [fm removeItemAtPath:tmpDir error:nil];
 
-        printf("✅ All 5 test suites PASSED successfully!\n");
+        printf("✅ All 6 test suites PASSED successfully!\n");
     }
     return 0;
 }
