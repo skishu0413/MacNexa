@@ -76,7 +76,9 @@ typedef NS_ERROR_ENUM(MNStorageErrorDomain, MNStorageErrorCode) {
 
 - (instancetype)init;
 - (instancetype)initWithSecretStore:(id<MNSecretStoring>)secretStore;
+- (instancetype)initWithSecretStore:(id<MNSecretStoring>)secretStore localPeerId:(nullable NSString *)localPeerId;
 - (void)clearLastStorageError;
+- (void)resetReplayHistory;
 
 @property (nonatomic, readonly) NSString *localPeerId;
 @property (nonatomic, readonly) NSString *localPeerName;
@@ -107,8 +109,9 @@ typedef NS_ERROR_ENUM(MNStorageErrorDomain, MNStorageErrorCode) {
 // SAS (Short Authentication String) Calculation
 - (NSString *)computeSASFromSecret:(NSData *)secret peerA:(NSString *)peerA peerB:(NSString *)peerB;
 
-// Nonce Generation & Replay Protection
+// Nonce Generation & Replay Protection (with cross-restart persistence)
 - (uint64_t)nextOutgoingNonce;
+- (BOOL)checkAndCommitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;
 - (BOOL)isIncomingNonceValid:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;
 - (BOOL)commitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;
 - (BOOL)validateIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId;

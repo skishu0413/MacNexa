@@ -15,6 +15,8 @@ NSErrorDomain const MNStorageErrorDomain = @"com.macnexa.storage.error";
 
 static NSString * const kMNLocalPeerIdKey = @"com.macnexa.local_peer_id";
 static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
+static NSString * const kMNReplayHistoryKey = @"com.macnexa.replay_history";
+static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_nonce";
 
 #pragma mark - MNFileSecretStore Implementation
 
@@ -527,30 +529,51 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     return [self initWithSecretStore:[[MNFileSecretStore alloc] init]];
 }
 
-- (instancetype)initWithSecretStore:(id<MNSecretStoring>)secretStore {
+- (instancetype)initWithSecretStore:(id<MNSecretStoring>)secretStore localPeerId:(nullable NSString *)localPeerId {
     self = [super init];
     if (self) {
         _secretStore = secretStore ?: [[MNFileSecretStore alloc] init];
         _securityLock = [[NSLock alloc] init];
-        _lastSeenNonces = [NSMutableDictionary dictionary];
-        _currentNonce = (uint64_t)[[NSDate date] timeIntervalSince1970] * 1000;
 
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-        NSString *existingId = [defaults stringForKey:kMNLocalPeerIdKey];
-        if (!existingId) {
-            existingId = [[NSUUID UUID] UUIDString];
-            [defaults setObject:existingId forKey:kMNLocalPeerIdKey];
-            [defaults synchronize];
+        NSDictionary *savedNonces = [defaults dictionaryForKey:kMNReplayHistoryKey];
+        _lastSeenNonces = [savedNonces mutableCopy] ?: [NSMutableDictionary dictionary];
+
+        uint64_t savedOutgoing = (uint64_t)[defaults integerForKey:kMNLastOutgoingNonceKey];
+        uint64_t nowMs = (uint64_t)[[NSDate date] timeIntervalSince1970] * 1000;
+        _currentNonce = (savedOutgoing >= nowMs) ? (savedOutgoing + 1000) : nowMs;
+
+        if (localPeerId && localPeerId.length > 0) {
+            _localPeerId = [localPeerId copy];
+        } else {
+            NSString *existingId = [defaults stringForKey:kMNLocalPeerIdKey];
+            if (!existingId) {
+                existingId = [[NSUUID UUID] UUIDString];
+                [defaults setObject:existingId forKey:kMNLocalPeerIdKey];
+                [defaults synchronize];
+            }
+            _localPeerId = existingId;
         }
-        _localPeerId = existingId;
         _localPeerName = [[NSHost currentHost] localizedName] ?: @"Mac";
     }
     return self;
 }
 
+- (instancetype)initWithSecretStore:(id<MNSecretStoring>)secretStore {
+    return [self initWithSecretStore:secretStore localPeerId:nil];
+}
+
 - (void)clearLastStorageError {
     [self.securityLock lock];
     self.lastStorageError = nil;
+    [self.securityLock unlock];
+}
+
+- (void)resetReplayHistory {
+    [self.securityLock lock];
+    [self.lastSeenNonces removeAllObjects];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:kMNReplayHistoryKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
     [self.securityLock unlock];
 }
 
@@ -657,8 +680,11 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     if (meta) {
         [meta removeObjectForKey:peerId];
         [defaults setObject:meta forKey:kMNTrustedMetadataKey];
-        [defaults synchronize];
     }
+
+    [self.lastSeenNonces removeObjectForKey:peerId];
+    [defaults setObject:[self.lastSeenNonces copy] forKey:kMNReplayHistoryKey];
+    [defaults synchronize];
 
     [self.securityLock unlock];
     return YES;
@@ -743,8 +769,39 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     [self.securityLock lock];
     self.currentNonce++;
     uint64_t n = self.currentNonce;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setInteger:(NSInteger)n forKey:kMNLastOutgoingNonceKey];
+    [defaults synchronize];
     [self.securityLock unlock];
     return n;
+}
+
+- (BOOL)checkAndCommitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
+    if (!peerId) return NO;
+    [self.securityLock lock];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    // 1. Strict 30-second window to prevent replaying captured frames
+    if (fabs(now - timestamp) > 30.0) {
+        [self.securityLock unlock];
+        return NO;
+    }
+
+    // 2. Nonce must strictly increase monotonically
+    NSNumber *last = self.lastSeenNonces[peerId];
+    if (last && nonce <= [last unsignedLongLongValue]) {
+        [self.securityLock unlock];
+        return NO;
+    }
+
+    // 3. Atomically mutate state and persist across restarts
+    self.lastSeenNonces[peerId] = @(nonce);
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:[self.lastSeenNonces copy] forKey:kMNReplayHistoryKey];
+    [defaults synchronize];
+
+    [self.securityLock unlock];
+    return YES;
 }
 
 - (BOOL)isIncomingNonceValid:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
@@ -752,13 +809,11 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     [self.securityLock lock];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 
-    // Strict 30-second window to prevent replaying captured frames
     if (fabs(now - timestamp) > 30.0) {
         [self.securityLock unlock];
         return NO;
     }
 
-    // Nonce must strictly increase monotonically (read-only verification, NO state mutation)
     NSNumber *last = self.lastSeenNonces[peerId];
     if (last && nonce <= [last unsignedLongLongValue]) {
         [self.securityLock unlock];
@@ -770,32 +825,11 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 }
 
 - (BOOL)commitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
-    if (!peerId) return NO;
-    [self.securityLock lock];
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-
-    // Re-verify timestamp window under lock
-    if (fabs(now - timestamp) > 30.0) {
-        [self.securityLock unlock];
-        return NO;
-    }
-
-    // Nonce must strictly increase monotonically
-    NSNumber *last = self.lastSeenNonces[peerId];
-    if (last && nonce <= [last unsignedLongLongValue]) {
-        [self.securityLock unlock];
-        return NO;
-    }
-
-    // State mutation ONLY occurs after message authenticity has been verified
-    self.lastSeenNonces[peerId] = @(nonce);
-    [self.securityLock unlock];
-    return YES;
+    return [self checkAndCommitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId];
 }
 
 - (BOOL)validateIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
-    // Convenience: validate and commit in one step
-    return [self commitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId];
+    return [self checkAndCommitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId];
 }
 
 #pragma mark - Authenticated Encryption (AES-256 + HMAC-SHA256 Encrypt-then-MAC)
@@ -882,19 +916,14 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 
     if (ivData.length != 16 || tagData.length != CC_SHA256_DIGEST_LENGTH || cipherData.length == 0) return nil;
 
-    // 1. Replay & Timestamp Pre-Check (Read-only verification; DO NOT mutate state yet!)
-    // An unauthenticated attacker sending forged envelopes with huge nonces will not poison replay state.
-    if (![self isIncomingNonceValid:nonce timestamp:timestamp fromPeer:peerId]) {
-        return nil;
-    }
-
-    // 2. Derive K_enc and K_mac
+    // 1. Authenticate FIRST: Derive subkeys and verify HMAC-SHA256 Tag
+    // Any unauthenticated or forged packet is dropped immediately.
+    // Zero replay state is read or mutated for unauthenticated packets.
     unsigned char k_enc[CC_SHA256_DIGEST_LENGTH];
     unsigned char k_mac[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, masterSecret.bytes, masterSecret.length, "macnexa-enc", 11, k_enc);
     CCHmac(kCCHmacAlgSHA256, masterSecret.bytes, masterSecret.length, "macnexa-mac", 11, k_mac);
 
-    // 3. Constant-Time HMAC-SHA256 Tag Verification (Authenticity & Integrity Check)
     NSMutableData *macInput = [NSMutableData dataWithData:ivData];
     [macInput appendData:cipherData];
     uint64_t bigNonce = CFSwapInt64HostToBig(nonce);
@@ -908,15 +937,17 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 
     // Constant-time check prevents timing attacks
     if (timingsafe_bcmp(tagData.bytes, expectedTag, CC_SHA256_DIGEST_LENGTH) != 0) {
-        return nil; // Tampering or forgery detected! Nonce state is untouched.
+        return nil; // Forged or invalid packet! Dropped before checking or mutating replay state.
     }
 
-    // 4. Commit Nonce ONLY AFTER HMAC Authentication is Verified
-    if (![self commitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId]) {
-        return nil;
+    // 2. Atomically check and commit replay state ONLY AFTER HMAC authentication succeeds
+    // Both freshness (30-second window) and monotonicity (nonce > lastSeen) are checked,
+    // and committed in a single locked atomic operation that persists to disk across restarts.
+    if (![self checkAndCommitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId]) {
+        return nil; // Replay detected or timestamp out of window!
     }
 
-    // 5. Decrypt AES-256 Ciphertext
+    // 3. Decrypt AES-256 Ciphertext
     NSMutableData *plainData = [NSMutableData dataWithLength:cipherData.length];
     size_t numBytesDecrypted = 0;
     CCCryptorStatus status = CCCrypt(

@@ -198,11 +198,17 @@ int main(int argc, const char * argv[]) {
         // Test 5: Replay Protection & DoS Resistance (Unauthenticated Nonce Tampering)
         // -------------------------------------------------------------
         printf("  [5/6] Testing replay protection immunity against unauthenticated nonce DoS...\n");
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"com.macnexa.replay_history"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+
         // Set up two communicating peers: senderMac and receiverMac sharing a secret
         NSData *sharedKey = [@"32ByteCryptographicSharedSecret!" dataUsingEncoding:NSUTF8StringEncoding];
 
-        MNSecurity *receiverMac = [[MNSecurity alloc] initWithSecretStore:store];
-        MNSecurity *senderMac = [[MNSecurity alloc] initWithSecretStore:store];
+        NSString *receiverPeerId = [NSString stringWithFormat:@"receiver-test-%u", arc4random()];
+        NSString *senderPeerId = [NSString stringWithFormat:@"sender-test-%u", arc4random()];
+
+        MNSecurity *receiverMac = [[MNSecurity alloc] initWithSecretStore:store localPeerId:receiverPeerId];
+        MNSecurity *senderMac = [[MNSecurity alloc] initWithSecretStore:store localPeerId:senderPeerId];
 
         // Receiver trusts senderMac.localPeerId
         NSString *senderId = senderMac.localPeerId;
@@ -246,10 +252,26 @@ int main(int argc, const char * argv[]) {
         ASSERT_TRUE(decrypted2 != nil, "Legitimate command with nonce 1001 MUST succeed despite prior attack packet!");
         ASSERT_TRUE([decrypted2[@"action"] isEqualToString:@"releaseAccessory"], "Command 2 action must match");
 
+        // 5. Restart behavior: Simulate receiver daemon restart by creating a new MNSecurity instance.
+        // It must load persistent replay history and reject replayed packet 2 even across restarts!
+        MNSecurity *restartedReceiver = [[MNSecurity alloc] initWithSecretStore:store localPeerId:receiverPeerId];
+        NSDictionary *postRestartReplay = [restartedReceiver decryptAndVerifyDictionary:legitEnvelope2 fromPeerId:senderId];
+        ASSERT_TRUE(postRestartReplay == nil, "Pre-restart envelope 2 must be rejected after restart (persistent replay protection)!");
+
+        // And new envelope 3 (nonce 1002) after restart must succeed
+        NSDictionary *legitCmd3 = @{ @"action": @"connectAccessory", @"target": @"mouse" };
+        NSDictionary *legitEnvelope3 = [senderMac encryptDictionary:legitCmd3 forPeerId:receiverMac.localPeerId nonce:1002 timestamp:now];
+        ASSERT_TRUE(legitEnvelope3 != nil, "legitEnvelope3 encryption should succeed");
+
+        NSDictionary *decrypted3 = [restartedReceiver decryptAndVerifyDictionary:legitEnvelope3 fromPeerId:senderId];
+        ASSERT_TRUE(decrypted3 != nil, "New command with nonce 1002 must succeed on restarted receiver!");
+        ASSERT_TRUE([decrypted3[@"action"] isEqualToString:@"connectAccessory"], "Command 3 action must match");
+
         // -------------------------------------------------------------
         // Test 6: Cleanup
         // -------------------------------------------------------------
         printf("  [6/6] Cleaning up test sandbox...\n");
+        [receiverMac resetReplayHistory];
         [fm removeItemAtPath:tmpDir error:nil];
 
         printf("✅ All 6 test suites PASSED successfully!\n");
