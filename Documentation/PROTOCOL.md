@@ -131,15 +131,18 @@ The plaintext decrypted from `ciphertext`:
 }
 ```
 
-### 2.5. Switch Acknowledgment (`switchAck`)
-Returned by the target Mac confirming whether peripheral acquisition succeeded:
+### 2.5. Authenticated Switch Acknowledgment (`switchAck`)
+Returned by the target Mac confirming peripheral acquisition status. The response is transmitted as an authenticated `encryptedEnvelope` (AES-256 + HMAC-SHA256 Encrypt-then-MAC) and cryptographically bound to the peer, session, and exact request nonce & HMAC tag:
 ```json
 {
   "action": "switchAck",
+  "requestNonce": 1727649821001,
+  "requestTag": "a8f3b9c...==",
   "success": true,
   "error": null
 }
 ```
+The initiating Mac decrypts the envelope, verifies constant-time HMAC-SHA256 authenticity and monotonic replay freshness, and validates that `requestNonce` and `requestTag` match the request sent in that session. Unauthenticated responses, plaintext responses, or binding mismatches trigger an immediate local rollback to recover accessories.
 
 ---
 

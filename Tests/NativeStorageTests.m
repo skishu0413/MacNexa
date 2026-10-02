@@ -339,15 +339,104 @@ int main(int argc, const char * argv[]) {
         ASSERT_TRUE([securityB isPeerTrusted:macAId], "Mac A must now be trusted on Mac B");
 
         // -------------------------------------------------------------
-        // Test 7: Cleanup
+        // Test 7: Authenticated Switch Acknowledgments & Request Bindings
         // -------------------------------------------------------------
-        printf("  [7/7] Cleaning up test sandbox...\n");
+        printf("  [7/8] Testing authenticated switch acknowledgments & request bindings...\n");
+        uint64_t switchReqNonce = 2000ULL;
+        NSTimeInterval switchTs = [[NSDate date] timeIntervalSince1970];
+
+        // 1. Sender (Mac A) sends switch request to Receiver (Mac B)
+        NSDictionary *switchReqPayload = @{
+            @"action": @"requestSwitch",
+            @"devices": @[ @{ @"address": @"AA-BB-CC-DD-EE-FF", @"name": @"Keyboard" } ]
+        };
+        NSDictionary *switchReqEnvelope = [securityA encryptDictionary:switchReqPayload
+                                                             forPeerId:macBId
+                                                                 nonce:switchReqNonce
+                                                             timestamp:switchTs];
+        ASSERT_TRUE(switchReqEnvelope != nil, "Switch request envelope encryption must succeed");
+        NSString *reqTag = switchReqEnvelope[@"tag"];
+        ASSERT_TRUE(reqTag != nil && reqTag.length > 0, "Switch request must produce a valid HMAC tag");
+
+        // 2. Receiver (Mac B) verifies switch request
+        NSDictionary *decryptedReq = [securityB decryptAndVerifyDictionary:switchReqEnvelope fromPeerId:macAId];
+        ASSERT_TRUE(decryptedReq != nil, "Receiver must decrypt legitimate switch request");
+
+        // 3. Receiver (Mac B) generates authenticated switch acknowledgment bound to exact requestNonce & requestTag
+        NSDictionary *wireAck = [securityB encryptSwitchAcknowledgment:YES
+                                                                 error:nil
+                                                          requestNonce:switchReqNonce
+                                                            requestTag:reqTag
+                                                             forPeerId:macAId];
+        ASSERT_TRUE(wireAck != nil, "Switch acknowledgment encryption must succeed");
+        ASSERT_TRUE([wireAck[@"action"] isEqualToString:@"encryptedEnvelope"], "Switch acknowledgment must be sent as an encryptedEnvelope");
+
+        // 4. Sender (Mac A) decrypts and validates genuine acknowledgment
+        NSDictionary *decryptedAck = [securityA decryptAndVerifySwitchAcknowledgment:wireAck
+                                                                        expectedPeer:macBId
+                                                                        requestNonce:switchReqNonce
+                                                                          requestTag:reqTag];
+        ASSERT_TRUE(decryptedAck != nil, "Sender must successfully verify genuine switch acknowledgment");
+        ASSERT_TRUE([decryptedAck[@"success"] boolValue], "Acknowledgment success must be YES");
+
+        // 5. Threat 1: Malicious endpoint sending plain JSON success
+        NSDictionary *plainFakeAck = @{ @"action": @"switchAck", @"success": @YES };
+        NSDictionary *plainFakeResult = [securityA decryptAndVerifySwitchAcknowledgment:plainFakeAck
+                                                                           expectedPeer:macBId
+                                                                           requestNonce:switchReqNonce
+                                                                             requestTag:reqTag];
+        ASSERT_TRUE(plainFakeResult == nil, "Unauthenticated plain JSON switch acknowledgment MUST be rejected!");
+
+        // 6. Threat 2: Mismatched requestNonce (session injection / replay from different request)
+        NSDictionary *mismatchedNonceAck = [securityB encryptSwitchAcknowledgment:YES
+                                                                            error:nil
+                                                                     requestNonce:999999ULL
+                                                                       requestTag:reqTag
+                                                                        forPeerId:macAId];
+        NSDictionary *mismatchedNonceResult = [securityA decryptAndVerifySwitchAcknowledgment:mismatchedNonceAck
+                                                                                 expectedPeer:macBId
+                                                                                 requestNonce:switchReqNonce
+                                                                                   requestTag:reqTag];
+        ASSERT_TRUE(mismatchedNonceResult == nil, "Acknowledgment with wrong requestNonce MUST be rejected!");
+
+        // 7. Threat 3: Mismatched requestTag (binding mismatch)
+        NSDictionary *mismatchedTagAck = [securityB encryptSwitchAcknowledgment:YES
+                                                                          error:nil
+                                                                   requestNonce:switchReqNonce
+                                                                     requestTag:@"forgedTagAAAAAAAAAAAAAAAAAAAAA="
+                                                                      forPeerId:macAId];
+        NSDictionary *mismatchedTagResult = [securityA decryptAndVerifySwitchAcknowledgment:mismatchedTagAck
+                                                                               expectedPeer:macBId
+                                                                               requestNonce:switchReqNonce
+                                                                                 requestTag:reqTag];
+        ASSERT_TRUE(mismatchedTagResult == nil, "Acknowledgment with wrong requestTag MUST be rejected!");
+
+        // 8. Threat 4: Tampered ciphertext / HMAC tag in acknowledgment envelope
+        NSMutableDictionary *tamperedAck = [wireAck mutableCopy];
+        tamperedAck[@"tag"] = @"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        NSDictionary *tamperedResult = [securityA decryptAndVerifySwitchAcknowledgment:tamperedAck
+                                                                          expectedPeer:macBId
+                                                                          requestNonce:switchReqNonce
+                                                                            requestTag:reqTag];
+        ASSERT_TRUE(tamperedResult == nil, "Tampered switch acknowledgment envelope MUST fail HMAC verification!");
+
+        // 9. Threat 5: Acknowledgment from unexpected / rogue peer
+        NSDictionary *wrongPeerResult = [securityA decryptAndVerifySwitchAcknowledgment:wireAck
+                                                                           expectedPeer:@"rogue-peer-id"
+                                                                           requestNonce:switchReqNonce
+                                                                             requestTag:reqTag];
+        ASSERT_TRUE(wrongPeerResult == nil, "Switch acknowledgment from unexpected peer MUST be rejected!");
+
+        // -------------------------------------------------------------
+        // Test 8: Cleanup
+        // -------------------------------------------------------------
+        printf("  [8/8] Cleaning up test sandbox...\n");
         [receiverMac resetReplayHistory];
         [securityA resetReplayHistory];
         [securityB resetReplayHistory];
         [fm removeItemAtPath:tmpDir error:nil];
 
-        printf("✅ All 7 test suites PASSED successfully!\n");
+        printf("✅ All 8 test suites PASSED successfully!\n");
     }
     return 0;
 }

@@ -999,4 +999,61 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
     return [NSJSONSerialization JSONObjectWithData:plainData options:0 error:nil];
 }
 
+#pragma mark - Authenticated Switch Acknowledgments
+
+- (nullable NSDictionary *)encryptSwitchAcknowledgment:(BOOL)success
+                                                 error:(nullable NSString *)error
+                                          requestNonce:(uint64_t)requestNonce
+                                            requestTag:(NSString *)requestTag
+                                             forPeerId:(NSString *)peerId {
+    if (!peerId || !requestTag) return nil;
+
+    uint64_t ackNonce = [self nextOutgoingNonce];
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
+    NSDictionary *innerAck = @{
+        @"action": @"switchAck",
+        @"requestNonce": @(requestNonce),
+        @"requestTag": requestTag,
+        @"success": @(success),
+        @"error": error ?: [NSNull null]
+    };
+
+    NSDictionary *envelope = [self encryptDictionary:innerAck
+                                           forPeerId:peerId
+                                               nonce:ackNonce
+                                           timestamp:now];
+    if (!envelope) return nil;
+
+    NSMutableDictionary *wireMsg = [envelope mutableCopy];
+    wireMsg[@"action"] = @"encryptedEnvelope";
+    return wireMsg;
+}
+
+- (nullable NSDictionary *)decryptAndVerifySwitchAcknowledgment:(NSDictionary *)envelope
+                                                   expectedPeer:(NSString *)peerId
+                                                   requestNonce:(uint64_t)expectedNonce
+                                                     requestTag:(NSString *)expectedTag {
+    if (!envelope || !peerId || !expectedTag) return nil;
+
+    if (![envelope[@"action"] isEqualToString:@"encryptedEnvelope"]) {
+        return nil; // Reject unauthenticated plaintext response
+    }
+
+    NSDictionary *decrypted = [self decryptAndVerifyDictionary:envelope fromPeerId:peerId];
+    if (!decrypted || ![decrypted[@"action"] isEqualToString:@"switchAck"]) {
+        return nil;
+    }
+
+    uint64_t ackReqNonce = [decrypted[@"requestNonce"] unsignedLongLongValue];
+    NSString *ackReqTag = decrypted[@"requestTag"];
+
+    // Cryptographically enforce exact request and session binding
+    if (ackReqNonce != expectedNonce || ![ackReqTag isEqualToString:expectedTag]) {
+        return nil;
+    }
+
+    return decrypted;
+}
+
 @end

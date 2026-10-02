@@ -137,6 +137,18 @@ typedef NS_ERROR_ENUM(MNStorageErrorDomain, MNStorageErrorCode) {
 - (nullable NSDictionary *)decryptAndVerifyDictionary:(NSDictionary *)envelope
                                            fromPeerId:(NSString *)peerId;
 
+// Authenticated Switch Acknowledgments (bound to peer, session, and exact request)
+- (nullable NSDictionary *)encryptSwitchAcknowledgment:(BOOL)success
+                                                 error:(nullable NSString *)error
+                                          requestNonce:(uint64_t)requestNonce
+                                            requestTag:(NSString *)requestTag
+                                             forPeerId:(NSString *)peerId;
+
+- (nullable NSDictionary *)decryptAndVerifySwitchAcknowledgment:(NSDictionary *)envelope
+                                                   expectedPeer:(NSString *)peerId
+                                                   requestNonce:(uint64_t)expectedNonce
+                                                     requestTag:(NSString *)expectedTag;
+
 @end
 
 NS_ASSUME_NONNULL_END

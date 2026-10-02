@@ -363,8 +363,6 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
         NSString *senderId = msg[@"senderId"];
 
         if (![[MNSecurity shared] isPeerTrusted:senderId]) {
-            NSDictionary *reply = @{ @"action": @"switchAck", @"success": @NO, @"error": @"Untrusted peer" };
-            [self sendMessage:reply toSocket:sock];
             close(sock);
             return;
         }
@@ -372,11 +370,12 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
         // Decrypt & verify constant-time HMAC-SHA256 signature + replay protection
         NSDictionary *decrypted = [[MNSecurity shared] decryptAndVerifyDictionary:msg fromPeerId:senderId];
         if (!decrypted || ![decrypted[@"action"] isEqualToString:@"requestSwitch"]) {
-            NSDictionary *reply = @{ @"action": @"switchAck", @"success": @NO, @"error": @"Cryptographic verification failed" };
-            [self sendMessage:reply toSocket:sock];
             close(sock);
             return;
         }
+
+        uint64_t reqNonce = [msg[@"nonce"] unsignedLongLongValue];
+        NSString *reqTag = msg[@"tag"] ?: @"";
 
         NSArray *devices = decrypted[@"devices"];
         NSString *peerName = [[MNSecurity shared] trustedPeerInfo:senderId][@"name"] ?: @"Remote Mac";
@@ -386,15 +385,17 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 
         // Acquire peripherals
         [[MNBluetoothManager shared] acquireAccessories:devices completion:^(BOOL success, NSString *err) {
-            NSDictionary *reply = @{
-                @"action": @"switchAck",
-                @"success": @(success),
-                @"error": err ?: [NSNull null]
-            };
-            dispatch_async(self.netQueue, ^{
-                [self sendMessage:reply toSocket:sock];
-                close(sock);
-            });
+            // Send authenticated switch acknowledgment bound to exact requestNonce, requestTag, and peer
+            NSDictionary *wireAck = [[MNSecurity shared] encryptSwitchAcknowledgment:success
+                                                                               error:err
+                                                                        requestNonce:reqNonce
+                                                                          requestTag:reqTag
+                                                                           forPeerId:senderId];
+            if (wireAck) {
+                [self sendMessage:wireAck toSocket:sock];
+            }
+            close(sock);
+
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (self.delegate) [self.delegate networkSwitchDidCompleteWithPeer:peerName success:success error:err];
             });
@@ -667,19 +668,38 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
                 return;
             }
 
+            NSString *requestTag = envelope[@"tag"] ?: @"";
+
             NSMutableDictionary *wireMsg = [envelope mutableCopy];
             wireMsg[@"action"] = @"encryptedEnvelope";
 
             [self sendMessage:wireMsg toSocket:sock];
 
-            NSDictionary *ack = [self readMessageFromSocket:sock];
+            // Read authenticated switch acknowledgment from receiver
+            NSDictionary *wireAck = [self readMessageFromSocket:sock];
             close(sock);
 
-            BOOL success = [ack[@"success"] boolValue];
-            NSString *err = ack[@"error"] != [NSNull null] ? ack[@"error"] : nil;
+            // Decrypt and authenticate acknowledgment, verifying bindings to peer, session, and exact request
+            NSDictionary *decryptedAck = [[MNSecurity shared] decryptAndVerifySwitchAcknowledgment:wireAck
+                                                                                      expectedPeer:peerId
+                                                                                      requestNonce:nonce
+                                                                                        requestTag:requestTag];
+            if (!decryptedAck) {
+                // Unauthenticated, plain, tampered, or mismatched acknowledgment! Rollback!
+                [[MNBluetoothManager shared] acquireAccessories:devices completion:^(BOOL s, NSString *e) {}];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSString *failErr = @"Unauthenticated switch acknowledgment or request binding mismatch";
+                    if (self.delegate) [self.delegate networkSwitchDidCompleteWithPeer:peerName success:NO error:failErr];
+                    if (completion) completion(NO, failErr);
+                });
+                return;
+            }
+
+            BOOL success = [decryptedAck[@"success"] boolValue];
+            NSString *err = (decryptedAck[@"error"] && decryptedAck[@"error"] != [NSNull null]) ? decryptedAck[@"error"] : nil;
 
             if (!success) {
-                // Rollback: re-acquire locally
+                // Remote peer failed to acquire: Rollback!
                 [[MNBluetoothManager shared] acquireAccessories:devices completion:^(BOOL s, NSString *e) {}];
             }
 
