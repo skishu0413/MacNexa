@@ -23,3 +23,6 @@ jobs:
 
     - name: Compile Universal Native Engine
       run: ./run.sh --build-only
+
+    - name: Run Native Storage & Security Tests
+      run: ./run.sh --test

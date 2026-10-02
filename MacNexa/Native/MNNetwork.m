@@ -8,6 +8,7 @@
 #import "MNNetwork.h"
 #import "MNSecurity.h"
 #import "MNBluetoothManager.h"
+#import <Cocoa/Cocoa.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
@@ -264,14 +265,31 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
                                                                completion:^(BOOL accepted) {
                         dispatch_async(self.netQueue, ^{
                             if (accepted) {
-                                // Save secret to macOS Keychain
-                                [[MNSecurity shared] saveTrustedPeerId:peerId name:peerName secret:sharedSecret];
-                                NSDictionary *reply = @{
-                                    @"action": @"pairResponse",
-                                    @"accepted": @YES,
-                                    @"pubKey": [localPair.publicKeyData base64EncodedStringWithOptions:0]
-                                };
-                                [self sendMessage:reply toSocket:sock];
+                                NSError *saveErr = nil;
+                                BOOL ok = [[MNSecurity shared] saveTrustedPeerId:peerId name:peerName secret:sharedSecret error:&saveErr];
+                                if (!ok) {
+                                    NSLog(@"[MacNexa Network] ❌ Storage error saving trusted peer: %@", saveErr.localizedDescription);
+                                    NSDictionary *reply = @{
+                                        @"action": @"pairResponse",
+                                        @"accepted": @NO,
+                                        @"error": [NSString stringWithFormat:@"Storage error: %@", saveErr.localizedDescription]
+                                    };
+                                    [self sendMessage:reply toSocket:sock];
+                                    dispatch_async(dispatch_get_main_queue(), ^{
+                                        NSAlert *alert = [[NSAlert alloc] init];
+                                        alert.messageText = @"Pairing Storage Error";
+                                        alert.informativeText = [NSString stringWithFormat:@"Failed to save cryptographic keys for %@: %@\n\n%@",
+                                                                 peerName, saveErr.localizedDescription, saveErr.localizedRecoverySuggestion ?: @""];
+                                        [alert runModal];
+                                    });
+                                } else {
+                                    NSDictionary *reply = @{
+                                        @"action": @"pairResponse",
+                                        @"accepted": @YES,
+                                        @"pubKey": [localPair.publicKeyData base64EncodedStringWithOptions:0]
+                                    };
+                                    [self sendMessage:reply toSocket:sock];
+                                }
                             } else {
                                 NSDictionary *reply = @{ @"action": @"pairResponse", @"accepted": @NO };
                                 [self sendMessage:reply toSocket:sock];
@@ -446,10 +464,19 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
                                                                  code:sasCode
                                                            completion:^(BOOL accepted) {
                     if (accepted) {
-                        [[MNSecurity shared] saveTrustedPeerId:targetPeerId
-                                                         name:peer[@"name"]
-                                                       secret:sharedSecret];
-                        if (completion) completion(YES, nil);
+                        NSError *saveErr = nil;
+                        BOOL ok = [[MNSecurity shared] saveTrustedPeerId:targetPeerId
+                                                                    name:peer[@"name"]
+                                                                  secret:sharedSecret
+                                                                   error:&saveErr];
+                        if (ok) {
+                            if (completion) completion(YES, nil);
+                        } else {
+                            NSString *errMsg = [NSString stringWithFormat:@"Storage Error: %@\n%@",
+                                                saveErr.localizedDescription,
+                                                saveErr.localizedRecoverySuggestion ?: @""];
+                            if (completion) completion(NO, errMsg);
+                        }
                     } else {
                         if (completion) completion(NO, @"Pairing cancelled by user");
                     }

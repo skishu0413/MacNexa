@@ -30,7 +30,7 @@ MacNexa is comprised of two core components:
 │ • Accessory list   │ • Silent Pairing   │ • Hardened BSD Sockets       │
 │ • Battery display  │ • Device Unpairing │ • Ephemeral ECDH (P-256)     │
 │ • SAS verification │ • IOKit Battery    │ • AES-256 + HMAC-SHA256 EtM  │
-│   modals (NSAlert) │ • Device Profiles  │ • macOS Keychain Trust Store │
+│   modals (NSAlert) │ • Device Profiles  │ • Injected File Secret Store │
 └────────────────────┴────────────────────┴──────────────────────────────┘
 ```
 
@@ -38,7 +38,8 @@ MacNexa is comprised of two core components:
 - **Status Item**: Native macOS menu-bar status item displaying a clean, unobtrusive keyboard icon.
 - **Dynamic Menu**:
   - Live accessory list showing connected keyboards, trackpads, and mice with exact battery percentages (`🔋 88%`, `🪫 18% Low`).
-  - Auto-discovered and trusted peer list showing connectivity status (`Online` / `Offline`).
+  - Auto-discovered and trusted peer list showing connectivity status (`Online` / `Offline`) with direct unpair/forget options.
+  - Active storage issue warning banner if directory permissions, corruption, or write failures occur.
   - One-click peripheral reconnection button (`⚡ Connect / Reconnect Accessories`).
 - **Modal Presenter**: Displays high-priority verification dialogs (`NSAlert`) during mutual pairing to visually confirm the 6-digit Short Authentication String (SAS).
 
@@ -59,7 +60,12 @@ MacNexa is comprised of two core components:
 - **Ephemeral Key Exchange**: Generates NIST P-256 keypairs on demand via `SecKeyCreateRandomKey` and performs Diffie-Hellman via `SecKeyCopyKeyExchangeResult`.
 - **Authenticated Encryption**: Uses Encrypt-then-MAC (AES-256-PKCS7 + HMAC-SHA256) with unique 16-byte random IVs per message.
 - **Constant-Time Verification**: Verifies authentication tags using `timingsafe_bcmp` to prevent side-channel timing attacks.
-- **Hardware Keychain Storage**: Encrypted master secrets are stored in the macOS Keychain (`kSecClassGenericPassword`, service `com.macnexa.secrets`).
+- **Injected File Secret Store (`MNFileSecretStore`)**:
+  - Implements `<MNSecretStoring>` for pluggable storage and mock injection in unit tests.
+  - Persists secrets to `~/Library/Application Support/MacNexa/secrets.enc` encrypted with AES-256-CBC + HMAC-SHA256.
+  - Enforces `0700` POSIX directory permissions and `0600` file permissions on `secrets.seed` and `secrets.enc`.
+  - Safely quarantines corrupt files to `secrets.enc.corrupt.<timestamp>` to prevent daemon crashes or infinite error loops.
+  - Propagates all storage errors (`NSError`) to the UI via `lastStorageError` and native `NSAlert` dialogs.
 
 ### 2.4. Network Engine (`MNNetwork`)
 - **Peer Discovery**:

@@ -36,6 +36,10 @@ while [[ $# -gt 0 ]]; do
       MODE="build"
       shift
       ;;
+    --test|-t)
+      MODE="test"
+      shift
+      ;;
     --mock|-m)
       USE_MOCK=1
       shift
@@ -55,6 +59,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  (none)            Build, sign, and launch MacNexa"
       echo "  --build-only, -b  Compile and package app bundle without launching"
+      echo "  --test, -t        Run native storage & security test suite"
       echo "  --mock, -m        Launch with simulated Bluetooth devices (testing mode)"
       echo "  --logs, -l        Stream live MacNexa console logs"
       echo "  --clean, -c       Clean build artifacts"
@@ -75,8 +80,24 @@ fi
 
 if [[ "$MODE" == "clean" ]]; then
   log_info "Cleaning build artifacts..."
-  rm -rf build/MacNexa.app
+  rm -rf build/MacNexa.app build/native_storage_tests
   log_ok "Clean complete. Run ./run.sh to build."
+  exit 0
+fi
+
+if [[ "$MODE" == "test" ]]; then
+  log_info "Compiling and running MacNexa native storage test suite..."
+  mkdir -p build
+  clang -fobjc-arc -O2 \
+    -mmacosx-version-min=12.0 \
+    -framework Foundation \
+    -framework Security \
+    MacNexa/Native/MNSecurity.m \
+    Tests/NativeStorageTests.m \
+    -o build/native_storage_tests
+  ./build/native_storage_tests
+  rm -f build/native_storage_tests
+  log_ok "Native storage & security tests passed!"
   exit 0
 fi
 

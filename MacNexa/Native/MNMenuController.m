@@ -74,6 +74,21 @@
     [self.menu addItem:header];
     [self.menu addItem:[NSMenuItem separatorItem]];
 
+    // Storage Error Warning Banner (if any)
+    if ([MNSecurity shared].lastStorageError) {
+        NSError *err = [MNSecurity shared].lastStorageError;
+        NSString *warnTitle = [NSString stringWithFormat:@"⚠️ Storage Warning: %@", err.localizedDescription];
+        if (warnTitle.length > 45) {
+            warnTitle = [[warnTitle substringToIndex:42] stringByAppendingString:@"..."];
+        }
+        NSMenuItem *warnItem = [[NSMenuItem alloc] initWithTitle:warnTitle
+                                                          action:@selector(handleStorageWarningAlert)
+                                                   keyEquivalent:@""];
+        warnItem.target = self;
+        [self.menu addItem:warnItem];
+        [self.menu addItem:[NSMenuItem separatorItem]];
+    }
+
     // 1. Connected Accessories with Battery Percentage
     NSArray *connected = [[MNBluetoothManager shared] fetchConnectedAccessories];
     if (connected.count == 0) {
@@ -156,6 +171,25 @@
             peerItem.target = self;
             peerItem.representedObject = peerId;
             peerItem.enabled = isOnline;
+
+            // Submenu with quick switch and unpair/forget options
+            NSMenu *peerSubmenu = [[NSMenu alloc] initWithTitle:peerName];
+            NSMenuItem *subSwitch = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Switch Peripherals to %@", peerName]
+                                                               action:@selector(handleSwitchToPeer:)
+                                                        keyEquivalent:@""];
+            subSwitch.target = self;
+            subSwitch.representedObject = peerId;
+            subSwitch.enabled = isOnline;
+            [peerSubmenu addItem:subSwitch];
+
+            NSMenuItem *unpairAction = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Unpair / Forget %@", peerName]
+                                                                  action:@selector(handleUnpairPeer:)
+                                                           keyEquivalent:@""];
+            unpairAction.target = self;
+            unpairAction.representedObject = peerId;
+            [peerSubmenu addItem:unpairAction];
+
+            peerItem.submenu = peerSubmenu;
             [self.menu addItem:peerItem];
         }
     }
@@ -260,6 +294,58 @@
 
 - (void)handleRefresh {
     [[MNBluetoothManager shared] fetchConnectedAccessories];
+    [self rebuildMenu];
+}
+
+- (void)handleUnpairPeer:(NSMenuItem *)sender {
+    NSString *peerId = sender.representedObject;
+    if (!peerId) return;
+
+    NSDictionary *info = [[MNSecurity shared] trustedPeerInfo:peerId];
+    NSString *peerName = info[@"name"] ?: @"Mac";
+
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *confirmAlert = [[NSAlert alloc] init];
+    confirmAlert.messageText = [NSString stringWithFormat:@"Unpair %@?", peerName];
+    confirmAlert.informativeText = @"MacNexa will securely delete the stored cryptographic keys for this device. You will need to pair again to switch peripherals.";
+    [confirmAlert addButtonWithTitle:@"Unpair"];
+    [confirmAlert addButtonWithTitle:@"Cancel"];
+
+    if ([confirmAlert runModal] == NSAlertFirstButtonReturn) {
+        NSError *unpairError = nil;
+        BOOL ok = [[MNSecurity shared] removeTrustedPeerId:peerId error:&unpairError];
+        if (!ok) {
+            NSAlert *errAlert = [[NSAlert alloc] init];
+            errAlert.messageText = @"Unpairing Storage Error";
+            errAlert.informativeText = [NSString stringWithFormat:@"Could not delete secret from disk: %@\n\n%@",
+                                        unpairError.localizedDescription,
+                                        unpairError.localizedRecoverySuggestion ?: @""];
+            [errAlert runModal];
+        } else {
+            [self rebuildMenu];
+        }
+    }
+}
+
+- (void)handleStorageWarningAlert {
+    NSError *err = [MNSecurity shared].lastStorageError;
+    if (!err) return;
+
+    [NSApp activateIgnoringOtherApps:YES];
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"MacNexa Storage Warning";
+    alert.informativeText = [NSString stringWithFormat:@"%@\n\nSuggestion:\n%@",
+                             err.localizedDescription,
+                             err.localizedRecoverySuggestion ?: @"Check disk permissions or re-pair devices."];
+    [alert addButtonWithTitle:@"Dismiss"];
+    [alert addButtonWithTitle:@"Open Storage Folder"];
+
+    NSInteger resp = [alert runModal];
+    if (resp == NSAlertSecondButtonReturn) {
+        NSString *dir = [@"~/Library/Application Support/MacNexa" stringByExpandingTildeInPath];
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:dir]];
+    }
+    [[MNSecurity shared] clearLastStorageError];
     [self rebuildMenu];
 }
 

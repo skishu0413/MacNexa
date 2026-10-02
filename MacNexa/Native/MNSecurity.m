@@ -2,15 +2,496 @@
 //  MNSecurity.m
 //  MacNexa
 //
+//  Hardened Zero-Trust Cryptographic Engine & Injected File Secret Storage
+//
 
 #import "MNSecurity.h"
 #import <CommonCrypto/CommonHMAC.h>
 #import <CommonCrypto/CommonCryptor.h>
+#import <sys/stat.h>
 #import <string.h>
 
-static NSString * const kMNKeychainService = @"com.macnexa.secrets";
+NSErrorDomain const MNStorageErrorDomain = @"com.macnexa.storage.error";
+
 static NSString * const kMNLocalPeerIdKey = @"com.macnexa.local_peer_id";
 static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
+
+#pragma mark - MNFileSecretStore Implementation
+
+@interface MNFileSecretStore ()
+@property (nonatomic, strong) NSURL *directoryURL;
+@property (nonatomic, strong) NSURL *fileURL;
+@property (nonatomic, strong) NSURL *seedURL;
+@property (nonatomic, strong) NSLock *storeLock;
+@end
+
+@implementation MNFileSecretStore
+
+- (instancetype)init {
+    NSURL *appSupport = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+    NSURL *macNexaDir = [appSupport URLByAppendingPathComponent:@"MacNexa" isDirectory:YES];
+    return [self initWithDirectoryURL:macNexaDir];
+}
+
+- (instancetype)initWithDirectoryPath:(NSString *)directoryPath {
+    return [self initWithDirectoryURL:[NSURL fileURLWithPath:[directoryPath stringByExpandingTildeInPath] isDirectory:YES]];
+}
+
+- (instancetype)initWithDirectoryURL:(NSURL *)directoryURL {
+    self = [super init];
+    if (self) {
+        _directoryURL = directoryURL;
+        _fileURL = [directoryURL URLByAppendingPathComponent:@"secrets.enc" isDirectory:NO];
+        _seedURL = [directoryURL URLByAppendingPathComponent:@"secrets.seed" isDirectory:NO];
+        _storeLock = [[NSLock alloc] init];
+
+        [self ensureDirectoryExistsWithError:nil];
+    }
+    return self;
+}
+
+- (BOOL)ensureDirectoryExistsWithError:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *path = self.directoryURL.path;
+    if (![fm fileExistsAtPath:path]) {
+        NSError *createErr = nil;
+        NSDictionary *attrs = @{ NSFilePosixPermissions: @(0700) };
+        if (![fm createDirectoryAtURL:self.directoryURL withIntermediateDirectories:YES attributes:attrs error:&createErr]) {
+            if (error) {
+                *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                             code:MNStorageErrorPermissionDenied
+                                         userInfo:@{
+                    NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to create storage directory at %@", path],
+                    NSLocalizedRecoverySuggestionErrorKey: @"Verify your user home directory permissions.",
+                    NSUnderlyingErrorKey: createErr ?: [NSNull null]
+                }];
+            }
+            return NO;
+        }
+    }
+    chmod([path fileSystemRepresentation], 0700);
+    return YES;
+}
+
+- (BOOL)enforceFilePermissionsWithError:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:self.directoryURL.path]) {
+        if (chmod(self.directoryURL.path.fileSystemRepresentation, 0700) != 0) {
+            if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: @"Failed to set 0700 on storage directory"}];
+            return NO;
+        }
+    }
+    if ([fm fileExistsAtPath:self.seedURL.path]) {
+        if (chmod(self.seedURL.path.fileSystemRepresentation, 0600) != 0) {
+            if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: @"Failed to set 0600 on seed file"}];
+            return NO;
+        }
+    }
+    if ([fm fileExistsAtPath:self.fileURL.path]) {
+        if (chmod(self.fileURL.path.fileSystemRepresentation, 0600) != 0) {
+            if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey: @"Failed to set 0600 on secrets file"}];
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (void)quarantineCorruptFileAtURL:(NSURL *)url reason:(NSString *)reason {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:url.path]) return;
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSString *corruptName = [NSString stringWithFormat:@"%@.corrupt.%ld", url.lastPathComponent, (long)now];
+    NSURL *dest = [url.URLByDeletingLastPathComponent URLByAppendingPathComponent:corruptName];
+    [fm moveItemAtURL:url toURL:dest error:nil];
+    if ([fm fileExistsAtPath:dest.path]) {
+        chmod(dest.path.fileSystemRepresentation, 0600);
+    }
+    NSLog(@"[MacNexa Storage] ⚠️ QUARANTINED corrupt file: %@ -> %@ (Reason: %@)", url.lastPathComponent, corruptName, reason);
+}
+
+- (nullable NSData *)loadOrCreateMasterKeyWithError:(NSError **)error {
+    if (![self ensureDirectoryExistsWithError:error]) return nil;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *seedPath = self.seedURL.path;
+
+    if ([fm fileExistsAtPath:seedPath]) {
+        chmod(seedPath.fileSystemRepresentation, 0600);
+        NSData *existing = [NSData dataWithContentsOfURL:self.seedURL];
+        if (existing && existing.length == 32) {
+            return existing;
+        }
+        // Corruption in seed file
+        [self quarantineCorruptFileAtURL:self.seedURL reason:@"Seed file is corrupted or not exactly 32 bytes"];
+    }
+
+    // Generate fresh 32 bytes
+    NSMutableData *seed = [NSMutableData dataWithLength:32];
+    int status = SecRandomCopyBytes(kSecRandomDefault, 32, seed.mutableBytes);
+    if (status != errSecSuccess) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorSeedGenerationFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Failed to generate cryptographically secure random seed.",
+                NSLocalizedRecoverySuggestionErrorKey: @"Ensure system entropy pool is available."
+            }];
+        }
+        return nil;
+    }
+
+    NSError *wErr = nil;
+    if (![seed writeToURL:self.seedURL options:NSDataWritingAtomic error:&wErr]) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorWriteFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to write seed file: %@", wErr.localizedDescription],
+                NSUnderlyingErrorKey: wErr ?: [NSNull null]
+            }];
+        }
+        return nil;
+    }
+
+    chmod(seedPath.fileSystemRepresentation, 0600);
+    [fm setAttributes:@{NSFilePosixPermissions: @(0600)} ofItemAtPath:seedPath error:nil];
+    return seed;
+}
+
+- (nullable NSMutableDictionary<NSString *, NSData *> *)readAllDictionaryWithError:(NSError **)error {
+    if (![self ensureDirectoryExistsWithError:error]) return nil;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:self.fileURL.path]) {
+        return [NSMutableDictionary dictionary];
+    }
+
+    chmod(self.fileURL.path.fileSystemRepresentation, 0600);
+
+    NSError *rErr = nil;
+    NSData *raw = [NSData dataWithContentsOfURL:self.fileURL options:0 error:&rErr];
+    if (!raw) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorCorruptedData
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to read secrets file: %@", rErr.localizedDescription],
+                NSUnderlyingErrorKey: rErr ?: [NSNull null]
+            }];
+        }
+        return nil;
+    }
+
+    if (raw.length == 0) {
+        return [NSMutableDictionary dictionary];
+    }
+
+    // Header layout:
+    // Magic: "MNSS" (4 bytes)
+    // Version: 0x01 (1 byte)
+    // IV: 16 bytes
+    // HMAC: 32 bytes (SHA-256)
+    // Ciphertext: remaining bytes (must be multiple of 16)
+    const size_t kHeaderSize = 4 + 1 + 16 + 32; // 53 bytes
+    if (raw.length < kHeaderSize) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:@"File truncated (less than 53-byte header)"];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorCorruptedData
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Encrypted secret store is truncated or corrupted.",
+                NSLocalizedRecoverySuggestionErrorKey: @"The corrupted store has been quarantined to prevent further errors. Please re-pair your Macs."
+            }];
+        }
+        return nil;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)raw.bytes;
+    if (memcmp(bytes, "MNSS", 4) != 0) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:@"Invalid header magic signature"];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorCorruptedData
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Secret store has an invalid file header signature.",
+                NSLocalizedRecoverySuggestionErrorKey: @"The corrupted file was safely quarantined."
+            }];
+        }
+        return nil;
+    }
+
+    uint8_t version = bytes[4];
+    if (version != 0x01) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:[NSString stringWithFormat:@"Unsupported store version: %d", version]];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorCorruptedData
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Unsupported secret store version %d.", version]
+            }];
+        }
+        return nil;
+    }
+
+    NSData *masterKey = [self loadOrCreateMasterKeyWithError:error];
+    if (!masterKey) return nil;
+
+    const uint8_t *iv = bytes + 5;
+    const uint8_t *storedHmac = bytes + 21;
+    const uint8_t *ciphertext = bytes + 53;
+    size_t cipherLen = raw.length - 53;
+
+    if (cipherLen == 0 || (cipherLen % kCCBlockSizeAES128 != 0)) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:@"Ciphertext length is not a multiple of AES block size"];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorCorruptedData
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Secret store ciphertext is truncated or corrupted."
+            }];
+        }
+        return nil;
+    }
+
+    // Compute HMAC over (Magic[4] + Version[1] + IV[16] + Ciphertext[cipherLen])
+    NSMutableData *macData = [NSMutableData dataWithBytes:bytes length:5];
+    [macData appendBytes:iv length:16];
+    [macData appendBytes:ciphertext length:cipherLen];
+
+    uint8_t computedHmac[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, masterKey.bytes, masterKey.length, macData.bytes, macData.length, computedHmac);
+
+    if (timingsafe_bcmp(computedHmac, storedHmac, CC_SHA256_DIGEST_LENGTH) != 0) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:@"HMAC verification failed (tampered or corrupted data)"];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorDecryptionFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Secret store HMAC authentication failed. The data is corrupted or has been tampered with.",
+                NSLocalizedRecoverySuggestionErrorKey: @"The corrupted file was safely quarantined."
+            }];
+        }
+        return nil;
+    }
+
+    // Decrypt ciphertext
+    NSMutableData *plainData = [NSMutableData dataWithLength:cipherLen];
+    size_t numDecrypted = 0;
+    CCCryptorStatus status = CCCrypt(
+        kCCDecrypt,
+        kCCAlgorithmAES,
+        kCCOptionPKCS7Padding,
+        masterKey.bytes,
+        kCCKeySizeAES256,
+        iv,
+        ciphertext,
+        cipherLen,
+        plainData.mutableBytes,
+        plainData.length,
+        &numDecrypted
+    );
+    if (status != kCCSuccess) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:@"AES-256 decryption failed"];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorDecryptionFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"AES decryption failed with status %d.", (int)status]
+            }];
+        }
+        return nil;
+    }
+    plainData.length = numDecrypted;
+
+    NSError *jsonErr = nil;
+    NSDictionary *rawDict = [NSJSONSerialization JSONObjectWithData:plainData options:0 error:&jsonErr];
+    if (![rawDict isKindOfClass:[NSDictionary class]]) {
+        [self quarantineCorruptFileAtURL:self.fileURL reason:@"JSON payload is not a dictionary"];
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorCorruptedData
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Failed to decode JSON dictionary from decrypted secret store.",
+                NSUnderlyingErrorKey: jsonErr ?: [NSNull null]
+            }];
+        }
+        return nil;
+    }
+
+    NSMutableDictionary<NSString *, NSData *> *result = [NSMutableDictionary dictionaryWithCapacity:rawDict.count];
+    for (NSString *k in rawDict) {
+        NSString *b64 = rawDict[k];
+        if ([b64 isKindOfClass:[NSString class]]) {
+            NSData *sec = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+            if (sec) {
+                result[k] = sec;
+            }
+        }
+    }
+    return result;
+}
+
+- (BOOL)writeAllDictionary:(NSDictionary<NSString *, NSData *> *)dict error:(NSError **)error {
+    if (![self ensureDirectoryExistsWithError:error]) return NO;
+
+    NSData *masterKey = [self loadOrCreateMasterKeyWithError:error];
+    if (!masterKey) return NO;
+
+    NSMutableDictionary<NSString *, NSString *> *wireDict = [NSMutableDictionary dictionaryWithCapacity:dict.count];
+    for (NSString *k in dict) {
+        NSData *val = dict[k];
+        if ([val isKindOfClass:[NSData class]]) {
+            wireDict[k] = [val base64EncodedStringWithOptions:0];
+        }
+    }
+
+    NSError *jsonErr = nil;
+    NSData *plainData = [NSJSONSerialization dataWithJSONObject:wireDict options:0 error:&jsonErr];
+    if (!plainData) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorWriteFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: @"Failed to serialize secret store dictionary to JSON.",
+                NSUnderlyingErrorKey: jsonErr ?: [NSNull null]
+            }];
+        }
+        return NO;
+    }
+
+    // Generate 16 bytes random IV
+    uint8_t iv[16];
+    if (SecRandomCopyBytes(kSecRandomDefault, 16, iv) != errSecSuccess) {
+        arc4random_buf(iv, 16);
+    }
+
+    NSMutableData *cipherData = [NSMutableData dataWithLength:plainData.length + kCCBlockSizeAES128];
+    size_t numEncrypted = 0;
+    CCCryptorStatus status = CCCrypt(
+        kCCEncrypt,
+        kCCAlgorithmAES,
+        kCCOptionPKCS7Padding,
+        masterKey.bytes,
+        kCCKeySizeAES256,
+        iv,
+        plainData.bytes,
+        plainData.length,
+        cipherData.mutableBytes,
+        cipherData.length,
+        &numEncrypted
+    );
+    if (status != kCCSuccess) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorWriteFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"AES encryption failed with status %d.", (int)status]
+            }];
+        }
+        return NO;
+    }
+    cipherData.length = numEncrypted;
+
+    // Compute HMAC-SHA256 over Magic (4) + Version (1) + IV (16) + Ciphertext
+    NSMutableData *macData = [NSMutableData dataWithBytes:"MNSS" length:4];
+    uint8_t ver = 0x01;
+    [macData appendBytes:&ver length:1];
+    [macData appendBytes:iv length:16];
+    [macData appendData:cipherData];
+
+    uint8_t hmac[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, masterKey.bytes, masterKey.length, macData.bytes, macData.length, hmac);
+
+    // Assemble final container:
+    // Magic (4) + Version (1) + IV (16) + HMAC (32) + Ciphertext
+    NSMutableData *container = [NSMutableData dataWithBytes:"MNSS" length:4];
+    [container appendBytes:&ver length:1];
+    [container appendBytes:iv length:16];
+    [container appendBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
+    [container appendData:cipherData];
+
+    NSError *wErr = nil;
+    BOOL written = [container writeToURL:self.fileURL options:NSDataWritingAtomic error:&wErr];
+    if (!written) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorWriteFailed
+                                     userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to write secrets file atomically: %@", wErr.localizedDescription],
+                NSUnderlyingErrorKey: wErr ?: [NSNull null]
+            }];
+        }
+        return NO;
+    }
+
+    chmod(self.fileURL.path.fileSystemRepresentation, 0600);
+    [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0600)} ofItemAtPath:self.fileURL.path error:nil];
+    return YES;
+}
+
+#pragma mark - MNSecretStoring Protocol
+
+- (BOOL)setSecret:(NSData *)secret forKey:(NSString *)key error:(NSError **)error {
+    if (!key || !secret) {
+        if (error) *error = [NSError errorWithDomain:MNStorageErrorDomain code:MNStorageErrorInvalidKey userInfo:@{NSLocalizedDescriptionKey: @"Key and secret data must not be nil"}];
+        return NO;
+    }
+    [self.storeLock lock];
+    NSMutableDictionary *dict = [self readAllDictionaryWithError:error];
+    if (!dict) {
+        [self.storeLock unlock];
+        return NO;
+    }
+    dict[key] = secret;
+    BOOL ok = [self writeAllDictionary:dict error:error];
+    [self.storeLock unlock];
+    return ok;
+}
+
+- (nullable NSData *)secretForKey:(NSString *)key error:(NSError **)error {
+    if (!key) return nil;
+    [self.storeLock lock];
+    NSMutableDictionary *dict = [self readAllDictionaryWithError:error];
+    NSData *sec = dict[key];
+    [self.storeLock unlock];
+    return sec;
+}
+
+- (BOOL)removeSecretForKey:(NSString *)key error:(NSError **)error {
+    if (!key) return YES;
+    [self.storeLock lock];
+    NSMutableDictionary *dict = [self readAllDictionaryWithError:error];
+    if (!dict) {
+        [self.storeLock unlock];
+        return NO;
+    }
+    [dict removeObjectForKey:key];
+    BOOL ok = [self writeAllDictionary:dict error:error];
+    [self.storeLock unlock];
+    return ok;
+}
+
+- (nullable NSArray<NSString *> *)allKeysWithPrefix:(NSString *)prefix error:(NSError **)error {
+    [self.storeLock lock];
+    NSMutableDictionary *dict = [self readAllDictionaryWithError:error];
+    if (!dict) {
+        [self.storeLock unlock];
+        return nil;
+    }
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSString *k in dict) {
+        if (!prefix || prefix.length == 0 || [k hasPrefix:prefix]) {
+            [result addObject:k];
+        }
+    }
+    [self.storeLock unlock];
+    return result;
+}
+
+@end
+
+#pragma mark - MNEphemeralKeyPair Implementation
 
 @implementation MNEphemeralKeyPair
 - (void)dealloc {
@@ -20,6 +501,8 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     }
 }
 @end
+
+#pragma mark - MNSecurity Implementation
 
 @interface MNSecurity ()
 @property (nonatomic, copy) NSString *localPeerId;
@@ -41,8 +524,13 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 }
 
 - (instancetype)init {
+    return [self initWithSecretStore:[[MNFileSecretStore alloc] init]];
+}
+
+- (instancetype)initWithSecretStore:(id<MNSecretStoring>)secretStore {
     self = [super init];
     if (self) {
+        _secretStore = secretStore ?: [[MNFileSecretStore alloc] init];
         _securityLock = [[NSLock alloc] init];
         _lastSeenNonces = [NSMutableDictionary dictionary];
         _currentNonce = (uint64_t)[[NSDate date] timeIntervalSince1970] * 1000;
@@ -60,52 +548,17 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     return self;
 }
 
-#pragma mark - Keychain Storage
-
-- (void)saveSecretToKeychain:(NSData *)secret forAccount:(NSString *)account {
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: kMNKeychainService,
-        (__bridge id)kSecAttrAccount: account
-    };
-    SecItemDelete((__bridge CFDictionaryRef)query);
-
-    NSMutableDictionary *item = [query mutableCopy];
-    item[(__bridge id)kSecValueData] = secret;
-    item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
-    SecItemAdd((__bridge CFDictionaryRef)item, NULL);
-}
-
-- (nullable NSData *)loadSecretFromKeychainForAccount:(NSString *)account {
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: kMNKeychainService,
-        (__bridge id)kSecAttrAccount: account,
-        (__bridge id)kSecReturnData: @YES,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne
-    };
-    CFTypeRef result = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
-    if (status == errSecSuccess && result) {
-        return (__bridge_transfer NSData *)result;
-    }
-    return nil;
-}
-
-- (void)deleteSecretFromKeychainForAccount:(NSString *)account {
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: kMNKeychainService,
-        (__bridge id)kSecAttrAccount: account
-    };
-    SecItemDelete((__bridge CFDictionaryRef)query);
+- (void)clearLastStorageError {
+    [self.securityLock lock];
+    self.lastStorageError = nil;
+    [self.securityLock unlock];
 }
 
 #pragma mark - Trusted Peers Management
 
 - (BOOL)isPeerTrusted:(NSString *)peerId {
     if (!peerId) return NO;
-    return [self trustedPeerSecret:peerId] != nil;
+    return [self trustedPeerSecret:peerId error:nil] != nil;
 }
 
 - (nullable NSDictionary *)trustedPeerInfo:(NSString *)peerId {
@@ -114,9 +567,21 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     return meta[peerId];
 }
 
-- (nullable NSData *)trustedPeerSecret:(NSString *)peerId {
+- (nullable NSData *)trustedPeerSecret:(NSString *)peerId error:(NSError **)error {
     if (!peerId) return nil;
-    return [self loadSecretFromKeychainForAccount:peerId];
+    NSError *storeErr = nil;
+    NSData *sec = [self.secretStore secretForKey:peerId error:&storeErr];
+    if (storeErr) {
+        [self.securityLock lock];
+        self.lastStorageError = storeErr;
+        [self.securityLock unlock];
+        if (error) *error = storeErr;
+    }
+    return sec;
+}
+
+- (nullable NSData *)trustedPeerSecret:(NSString *)peerId {
+    return [self trustedPeerSecret:peerId error:nil];
 }
 
 - (NSArray<NSDictionary *> *)allTrustedPeers {
@@ -132,14 +597,31 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     return result;
 }
 
-- (void)saveTrustedPeerId:(NSString *)peerId name:(NSString *)name secret:(NSData *)secret {
-    if (!peerId || !secret) return;
-    [self.securityLock lock];
-    
-    // Save master key to hardware-encrypted Keychain
-    [self saveSecretToKeychain:secret forAccount:peerId];
+- (BOOL)saveTrustedPeerId:(NSString *)peerId
+                     name:(NSString *)name
+                   secret:(NSData *)secret
+                    error:(NSError **)error {
+    if (!peerId || !secret) {
+        if (error) {
+            *error = [NSError errorWithDomain:MNStorageErrorDomain
+                                         code:MNStorageErrorInvalidKey
+                                     userInfo:@{ NSLocalizedDescriptionKey: @"Peer ID and secret must not be nil." }];
+        }
+        return NO;
+    }
 
-    // Save non-sensitive metadata to NSUserDefaults
+    [self.securityLock lock];
+
+    NSError *storeErr = nil;
+    BOOL saved = [self.secretStore setSecret:secret forKey:peerId error:&storeErr];
+    if (!saved) {
+        self.lastStorageError = storeErr;
+        if (error) *error = storeErr;
+        [self.securityLock unlock];
+        return NO;
+    }
+
+    // Save metadata
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSMutableDictionary *meta = [[defaults dictionaryForKey:kMNTrustedMetadataKey] mutableCopy] ?: [NSMutableDictionary dictionary];
     meta[peerId] = @{
@@ -150,12 +632,25 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     [defaults synchronize];
 
     [self.securityLock unlock];
+    return YES;
 }
 
-- (void)removeTrustedPeerId:(NSString *)peerId {
-    if (!peerId) return;
+- (void)saveTrustedPeerId:(NSString *)peerId name:(NSString *)name secret:(NSData *)secret {
+    [self saveTrustedPeerId:peerId name:name secret:secret error:nil];
+}
+
+- (BOOL)removeTrustedPeerId:(NSString *)peerId error:(NSError **)error {
+    if (!peerId) return YES;
     [self.securityLock lock];
-    [self deleteSecretFromKeychainForAccount:peerId];
+
+    NSError *storeErr = nil;
+    BOOL removed = [self.secretStore removeSecretForKey:peerId error:&storeErr];
+    if (!removed) {
+        self.lastStorageError = storeErr;
+        if (error) *error = storeErr;
+        [self.securityLock unlock];
+        return NO;
+    }
 
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSMutableDictionary *meta = [[defaults dictionaryForKey:kMNTrustedMetadataKey] mutableCopy];
@@ -164,12 +659,18 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
         [defaults setObject:meta forKey:kMNTrustedMetadataKey];
         [defaults synchronize];
     }
+
     [self.securityLock unlock];
+    return YES;
+}
+
+- (void)removeTrustedPeerId:(NSString *)peerId {
+    [self removeTrustedPeerId:peerId error:nil];
 }
 
 #pragma mark - Diffie-Hellman Key Exchange (ECDH P-256)
 
-- (MNEphemeralKeyPair *)generateEphemeralKeyPair {
+- (nullable MNEphemeralKeyPair *)generateEphemeralKeyPair {
     NSDictionary *params = @{
         (__bridge id)kSecAttrKeyType: (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
         (__bridge id)kSecAttrKeySizeInBits: @256
@@ -226,7 +727,7 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
 - (NSString *)computeSASFromSecret:(NSData *)secret peerA:(NSString *)peerA peerB:(NSString *)peerB {
     NSArray *sorted = [@[peerA ?: @"", peerB ?: @""] sortedArrayUsingSelector:@selector(compare:)];
     NSString *context = [NSString stringWithFormat:@"MacNexa-SAS-v1:%@:%@", sorted[0], sorted[1]];
-    
+
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, secret.bytes, secret.length, [context UTF8String], [context length], digest);
 
@@ -250,20 +751,20 @@ static NSString * const kMNTrustedMetadataKey = @"com.macnexa.trusted_metadata";
     if (!peerId) return NO;
     [self.securityLock lock];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    
+
     // Strict 30-second window to prevent replaying captured frames
     if (fabs(now - timestamp) > 30.0) {
         [self.securityLock unlock];
         return NO;
     }
-    
+
     // Nonce must strictly increase monotonically
     NSNumber *last = self.lastSeenNonces[peerId];
     if (last && nonce <= [last unsignedLongLongValue]) {
         [self.securityLock unlock];
         return NO;
     }
-    
+
     self.lastSeenNonces[peerId] = @(nonce);
     [self.securityLock unlock];
     return YES;

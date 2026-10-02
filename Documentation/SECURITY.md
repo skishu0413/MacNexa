@@ -27,7 +27,7 @@ We assume an adversary with the following capabilities:
 | **Replay Attacks** | Replay valid switch packets hours later to hijack peripherals. | **Monotonic Sequence Nonces + Timestamp Skew Windows** | Strict nonces ($\text{nonce} > \text{lastSeen}$) + 30-second timestamp drift limit. |
 | **Payload Tampering** | Modify destination device list or inject arbitrary actions. | **Encrypt-then-MAC (EtM)** | HMAC-SHA256 signature calculated over (IV $\parallel$ Ciphertext $\parallel$ Nonce $\parallel$ Timestamp $\parallel$ SenderID). |
 | **Timing Side-Channels** | Infer keys via byte-by-byte comparison timing differences. | **Constant-Time Memory Comparison** | Darwin kernel-grade `timingsafe_bcmp`. |
-| **Local Key Extraction** | Read stored pairing credentials from plaintext plists. | **Hardware-Backed macOS Keychain** | `SecItemAdd` with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. |
+| **Local Key Extraction** | Read stored pairing credentials from plaintext plists. | **Injected FileSecretStore (AES-256 + HMAC)** | Atomic writes, 0600 file permissions, 0700 directory permissions, per-install seed. |
 | **Network Denial of Service** | Freeze socket threads or spam alert modals. | **Strict Frame Caps, Timeouts & Rate Limiters** | Max 64 KB frames, 3-second `SO_RCVTIMEO`/`SO_SNDTIMEO`, 10s pairing cooldown. |
 
 ---
@@ -49,7 +49,7 @@ Master shared secrets are **never transmitted over the network**. When two Macs 
    $$\text{Digest} = \text{HMAC-SHA256}(K, \text{Context})$$
    $$\text{Code} = (\text{BigEndianUInt32}(\text{Digest}[0..3]) \pmod{900000}) + 100000$$
 7. Both users visually verify the 6-digit code on their respective screens. If a MitM attacker intervened, the derived keys diverge and the codes will not match.
-8. Upon user confirmation, $K$ is saved into the hardware-encrypted **macOS Keychain**.
+8. Upon user confirmation, $K$ is saved into the injected **File Secret Store** (`MNFileSecretStore`).
 
 ### 3.2. Authenticated Encryption (Encrypt-then-MAC)
 All operational commands (e.g. `requestSwitch`, device handoff payloads) are protected using Encrypt-then-MAC (EtM):
@@ -68,9 +68,19 @@ All operational commands (e.g. `requestSwitch`, device handoff payloads) are pro
 
 ## 4. Storage & Persistence Security
 
-- **Private Key Material**: Stored strictly in the **macOS Keychain** (`kSecClassGenericPassword`, service `com.macnexa.secrets`).
-  - Access control: `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` ensures keys remain encrypted until the user logs in and unlocks their Mac.
-- **Application Preferences**: `NSUserDefaults` (`com.macnexa.app`) stores only non-sensitive display metadata (e.g. peer machine names, pairing timestamps, cached battery percentages). No private keys or authentication tokens are ever written to disk plists.
+- **Injected Secret Store Interface (`MNSecretStoring`)**:
+  - `MNSecurity` delegates secret persistence to an injected `id<MNSecretStoring>` store (defaults to `MNFileSecretStore`), eliminating hard-coded Keychain dependencies and enabling testing/mock injection.
+- **Enforced POSIX Permissions**:
+  - Storage directory (`~/Library/Application Support/MacNexa`): Strictly locked to `0700` (`rwx------`).
+  - Seed file (`secrets.seed`): Cryptographically secure 256-bit random entropy, locked to `0600` (`rw-------`).
+  - Encrypted file (`secrets.enc`): Authenticated container (AES-256-CBC + HMAC-SHA256 Encrypt-then-MAC), written with `NSDataWritingAtomic` and locked to `0600` (`rw-------`).
+- **Safe Corruption Handling & Automatic Quarantine**:
+  - Truncated files, invalid headers, or failed HMAC checks are **never unhandled** and will never crash the daemon.
+  - Corrupted files are safely quarantined to `secrets.enc.corrupt.<timestamp>` to preserve forensics and clear blocked state for future pairing.
+- **Error Propagation to UI**:
+  - All storage failures (permission denials, disk write errors, corruption) return rich `NSError` instances.
+  - Errors reach the user via native `NSAlert` dialogs during pairing/unpairing and a menu bar warning banner with one-click recovery.
+- **Application Preferences**: `NSUserDefaults` (`com.macnexa.app`) stores only non-sensitive display metadata (e.g. peer machine names, pairing timestamps). No private keys or authentication tokens are ever stored in plaintext plists.
 
 ---
 
