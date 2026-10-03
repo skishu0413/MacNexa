@@ -537,7 +537,18 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 
         NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
         NSDictionary *savedNonces = [defaults dictionaryForKey:kMNReplayHistoryKey];
-        _lastSeenNonces = [savedNonces mutableCopy] ?: [NSMutableDictionary dictionary];
+        if ([savedNonces isKindOfClass:[NSDictionary class]]) {
+            NSMutableDictionary *validNonces = [NSMutableDictionary dictionaryWithCapacity:savedNonces.count];
+            for (id k in savedNonces) {
+                id v = savedNonces[k];
+                if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSNumber class]]) {
+                    validNonces[k] = v;
+                }
+            }
+            _lastSeenNonces = validNonces;
+        } else {
+            _lastSeenNonces = [NSMutableDictionary dictionary];
+        }
 
         uint64_t savedOutgoing = (uint64_t)[defaults integerForKey:kMNLastOutgoingNonceKey];
         uint64_t nowMs = (uint64_t)[[NSDate date] timeIntervalSince1970] * 1000;
@@ -580,18 +591,20 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 #pragma mark - Trusted Peers Management
 
 - (BOOL)isPeerTrusted:(NSString *)peerId {
-    if (!peerId) return NO;
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) return NO;
     return [self trustedPeerSecret:peerId error:nil] != nil;
 }
 
 - (nullable NSDictionary *)trustedPeerInfo:(NSString *)peerId {
-    if (!peerId) return nil;
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) return nil;
     NSDictionary *meta = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kMNTrustedMetadataKey];
-    return meta[peerId];
+    if (![meta isKindOfClass:[NSDictionary class]]) return nil;
+    id info = meta[peerId];
+    return [info isKindOfClass:[NSDictionary class]] ? (NSDictionary *)info : nil;
 }
 
 - (nullable NSData *)trustedPeerSecret:(NSString *)peerId error:(NSError **)error {
-    if (!peerId) return nil;
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) return nil;
     NSError *storeErr = nil;
     NSData *sec = [self.secretStore secretForKey:peerId error:&storeErr];
     if (storeErr) {
@@ -609,12 +622,18 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 
 - (NSArray<NSDictionary *> *)allTrustedPeers {
     NSDictionary *meta = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kMNTrustedMetadataKey];
+    if (![meta isKindOfClass:[NSDictionary class]]) return @[];
     NSMutableArray *result = [NSMutableArray array];
-    for (NSString *peerId in meta) {
+    for (id peerIdObj in meta) {
+        if (![peerIdObj isKindOfClass:[NSString class]]) continue;
+        NSString *peerId = (NSString *)peerIdObj;
         if ([self isPeerTrusted:peerId]) {
-            NSMutableDictionary *dict = [meta[peerId] mutableCopy];
-            dict[@"id"] = peerId;
-            [result addObject:dict];
+            id peerDictObj = meta[peerId];
+            if ([peerDictObj isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *dict = [peerDictObj mutableCopy];
+                dict[@"id"] = peerId;
+                [result addObject:dict];
+            }
         }
     }
     return result;
@@ -624,11 +643,12 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
                      name:(NSString *)name
                    secret:(NSData *)secret
                     error:(NSError **)error {
-    if (!peerId || !secret) {
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0 ||
+        !secret || ![secret isKindOfClass:[NSData class]] || secret.length == 0) {
         if (error) {
             *error = [NSError errorWithDomain:MNStorageErrorDomain
                                          code:MNStorageErrorInvalidKey
-                                     userInfo:@{ NSLocalizedDescriptionKey: @"Peer ID and secret must not be nil." }];
+                                     userInfo:@{ NSLocalizedDescriptionKey: @"Peer ID and secret must not be nil or empty." }];
         }
         return NO;
     }
@@ -646,9 +666,10 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 
     // Save metadata
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *meta = [[defaults dictionaryForKey:kMNTrustedMetadataKey] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSDictionary *existingMeta = [defaults dictionaryForKey:kMNTrustedMetadataKey];
+    NSMutableDictionary *meta = [existingMeta isKindOfClass:[NSDictionary class]] ? [existingMeta mutableCopy] : [NSMutableDictionary dictionary];
     meta[peerId] = @{
-        @"name": name ?: @"Mac",
+        @"name": ([name isKindOfClass:[NSString class]] && name.length > 0) ? name : @"Mac",
         @"pairedAt": @([[NSDate date] timeIntervalSince1970])
     };
     [defaults setObject:meta forKey:kMNTrustedMetadataKey];
@@ -721,7 +742,12 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 
 - (nullable NSData *)deriveSharedSecretWithPrivateKey:(SecKeyRef)privateKey
                                   remotePublicKeyData:(NSData *)remotePublicKeyData {
-    if (!privateKey || !remotePublicKeyData) return nil;
+    if (!privateKey || !remotePublicKeyData || ![remotePublicKeyData isKindOfClass:[NSData class]]) return nil;
+
+    // Validate decoded key size: P-256 public key is 65 bytes (uncompressed), 33 bytes (compressed), or 91 bytes (X.509)
+    if (remotePublicKeyData.length < 32 || remotePublicKeyData.length > 256) {
+        return nil;
+    }
 
     NSDictionary *keyParams = @{
         (__bridge id)kSecAttrKeyType: (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
@@ -751,7 +777,10 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 #pragma mark - SAS (Short Authentication String)
 
 - (NSString *)computeSASFromSecret:(NSData *)secret peerA:(NSString *)peerA peerB:(NSString *)peerB {
-    NSArray *sorted = [@[peerA ?: @"", peerB ?: @""] sortedArrayUsingSelector:@selector(compare:)];
+    if (!secret || ![secret isKindOfClass:[NSData class]] || secret.length == 0) return @"000 000";
+    NSString *pA = ([peerA isKindOfClass:[NSString class]]) ? peerA : @"";
+    NSString *pB = ([peerB isKindOfClass:[NSString class]]) ? peerB : @"";
+    NSArray *sorted = [@[pA, pB] sortedArrayUsingSelector:@selector(compare:)];
     NSString *context = [NSString stringWithFormat:@"MacNexa-SAS-v1:%@:%@", sorted[0], sorted[1]];
 
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
@@ -769,7 +798,10 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
                                                role:(NSString *)role
                                        senderPeerId:(NSString *)senderPeerId
                                      receiverPeerId:(NSString *)receiverPeerId {
-    if (!secret || secret.length == 0 || !role || !senderPeerId || !receiverPeerId) {
+    if (!secret || ![secret isKindOfClass:[NSData class]] || secret.length == 0 ||
+        !role || ![role isKindOfClass:[NSString class]] ||
+        !senderPeerId || ![senderPeerId isKindOfClass:[NSString class]] ||
+        !receiverPeerId || ![receiverPeerId isKindOfClass:[NSString class]]) {
         return [NSData data];
     }
     NSString *context = [NSString stringWithFormat:@"MacNexa-Pair-Confirm-v1:%@:%@:%@", role, senderPeerId, receiverPeerId];
@@ -783,7 +815,11 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
                                 role:(NSString *)role
                         senderPeerId:(NSString *)senderPeerId
                       receiverPeerId:(NSString *)receiverPeerId {
-    if (!tag || tag.length != CC_SHA256_DIGEST_LENGTH || !secret || secret.length == 0) {
+    if (!tag || ![tag isKindOfClass:[NSData class]] || tag.length != CC_SHA256_DIGEST_LENGTH ||
+        !secret || ![secret isKindOfClass:[NSData class]] || secret.length == 0 ||
+        !role || ![role isKindOfClass:[NSString class]] ||
+        !senderPeerId || ![senderPeerId isKindOfClass:[NSString class]] ||
+        !receiverPeerId || ![receiverPeerId isKindOfClass:[NSString class]]) {
         return NO;
     }
     NSData *expected = [self computePairingConfirmationTagWithSecret:secret
@@ -807,7 +843,7 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 }
 
 - (BOOL)checkAndCommitIncomingNonce:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
-    if (!peerId) return NO;
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) return NO;
     [self.securityLock lock];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 
@@ -819,7 +855,7 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 
     // 2. Nonce must strictly increase monotonically
     NSNumber *last = self.lastSeenNonces[peerId];
-    if (last && nonce <= [last unsignedLongLongValue]) {
+    if (last && [last isKindOfClass:[NSNumber class]] && nonce <= [last unsignedLongLongValue]) {
         [self.securityLock unlock];
         return NO;
     }
@@ -835,7 +871,7 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 }
 
 - (BOOL)isIncomingNonceValid:(uint64_t)nonce timestamp:(NSTimeInterval)timestamp fromPeer:(NSString *)peerId {
-    if (!peerId) return NO;
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) return NO;
     [self.securityLock lock];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
 
@@ -845,7 +881,7 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
     }
 
     NSNumber *last = self.lastSeenNonces[peerId];
-    if (last && nonce <= [last unsignedLongLongValue]) {
+    if (last && [last isKindOfClass:[NSNumber class]] && nonce <= [last unsignedLongLongValue]) {
         [self.securityLock unlock];
         return NO;
     }
@@ -868,8 +904,13 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
                                    forPeerId:(NSString *)peerId
                                        nonce:(uint64_t)nonce
                                    timestamp:(NSTimeInterval)timestamp {
+    if (!dict || ![dict isKindOfClass:[NSDictionary class]] ||
+        !peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) {
+        return nil;
+    }
+
     NSData *masterSecret = [self trustedPeerSecret:peerId];
-    if (!masterSecret) return nil;
+    if (!masterSecret || ![masterSecret isKindOfClass:[NSData class]]) return nil;
 
     // Derive K_enc and K_mac from masterSecret
     unsigned char k_enc[CC_SHA256_DIGEST_LENGTH];
@@ -929,26 +970,47 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
 
 - (nullable NSDictionary *)decryptAndVerifyDictionary:(NSDictionary *)envelope
                                            fromPeerId:(NSString *)peerId {
+    if (!envelope || ![envelope isKindOfClass:[NSDictionary class]] ||
+        !peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) {
+        return nil;
+    }
+
     NSData *masterSecret = [self trustedPeerSecret:peerId];
-    if (!masterSecret) return nil;
+    if (!masterSecret || ![masterSecret isKindOfClass:[NSData class]]) return nil;
 
-    uint64_t nonce = [envelope[@"nonce"] unsignedLongLongValue];
-    NSTimeInterval timestamp = [envelope[@"timestamp"] doubleValue];
-    NSString *b64IV = envelope[@"iv"];
-    NSString *b64Cipher = envelope[@"ciphertext"];
-    NSString *b64Tag = envelope[@"tag"];
+    id nonceObj = envelope[@"nonce"];
+    id tsObj = envelope[@"timestamp"];
+    id ivObj = envelope[@"iv"];
+    id cipherObj = envelope[@"ciphertext"];
+    id tagObj = envelope[@"tag"];
 
-    if (!b64IV || !b64Cipher || !b64Tag) return nil;
+    if (![nonceObj isKindOfClass:[NSNumber class]] ||
+        ![tsObj isKindOfClass:[NSNumber class]] ||
+        ![ivObj isKindOfClass:[NSString class]] ||
+        ![cipherObj isKindOfClass:[NSString class]] ||
+        ![tagObj isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+
+    uint64_t nonce = [nonceObj unsignedLongLongValue];
+    NSTimeInterval timestamp = [tsObj doubleValue];
+    NSString *b64IV = (NSString *)ivObj;
+    NSString *b64Cipher = (NSString *)cipherObj;
+    NSString *b64Tag = (NSString *)tagObj;
+
+    if (b64IV.length == 0 || b64Cipher.length == 0 || b64Tag.length == 0) return nil;
 
     NSData *ivData = [[NSData alloc] initWithBase64EncodedString:b64IV options:0];
     NSData *cipherData = [[NSData alloc] initWithBase64EncodedString:b64Cipher options:0];
     NSData *tagData = [[NSData alloc] initWithBase64EncodedString:b64Tag options:0];
 
-    if (ivData.length != 16 || tagData.length != CC_SHA256_DIGEST_LENGTH || cipherData.length == 0) return nil;
+    if (!ivData || ivData.length != 16 ||
+        !tagData || tagData.length != CC_SHA256_DIGEST_LENGTH ||
+        !cipherData || cipherData.length == 0) {
+        return nil;
+    }
 
     // 1. Authenticate FIRST: Derive subkeys and verify HMAC-SHA256 Tag
-    // Any unauthenticated or forged packet is dropped immediately.
-    // Zero replay state is read or mutated for unauthenticated packets.
     unsigned char k_enc[CC_SHA256_DIGEST_LENGTH];
     unsigned char k_mac[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, masterSecret.bytes, masterSecret.length, "macnexa-enc", 11, k_enc);
@@ -971,8 +1033,6 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
     }
 
     // 2. Atomically check and commit replay state ONLY AFTER HMAC authentication succeeds
-    // Both freshness (30-second window) and monotonicity (nonce > lastSeen) are checked,
-    // and committed in a single locked atomic operation that persists to disk across restarts.
     if (![self checkAndCommitIncomingNonce:nonce timestamp:timestamp fromPeer:peerId]) {
         return nil; // Replay detected or timestamp out of window!
     }
@@ -996,7 +1056,12 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
     if (status != kCCSuccess) return nil;
     plainData.length = numBytesDecrypted;
 
-    return [NSJSONSerialization JSONObjectWithData:plainData options:0 error:nil];
+    id parsed = [NSJSONSerialization JSONObjectWithData:plainData options:0 error:nil];
+    if (![parsed isKindOfClass:[NSDictionary class]]) {
+        return nil; // Top-level object inside ciphertext MUST be a dictionary
+    }
+
+    return (NSDictionary *)parsed;
 }
 
 #pragma mark - Authenticated Switch Acknowledgments
@@ -1006,7 +1071,10 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
                                           requestNonce:(uint64_t)requestNonce
                                             requestTag:(NSString *)requestTag
                                              forPeerId:(NSString *)peerId {
-    if (!peerId || !requestTag) return nil;
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0 ||
+        !requestTag || ![requestTag isKindOfClass:[NSString class]] || requestTag.length == 0) {
+        return nil;
+    }
 
     uint64_t ackNonce = [self nextOutgoingNonce];
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -1016,7 +1084,7 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
         @"requestNonce": @(requestNonce),
         @"requestTag": requestTag,
         @"success": @(success),
-        @"error": error ?: [NSNull null]
+        @"error": (error && [error isKindOfClass:[NSString class]]) ? error : [NSNull null]
     };
 
     NSDictionary *envelope = [self encryptDictionary:innerAck
@@ -1034,19 +1102,39 @@ static NSString * const kMNLastOutgoingNonceKey = @"com.macnexa.last_outgoing_no
                                                    expectedPeer:(NSString *)peerId
                                                    requestNonce:(uint64_t)expectedNonce
                                                      requestTag:(NSString *)expectedTag {
-    if (!envelope || !peerId || !expectedTag) return nil;
+    if (!envelope || ![envelope isKindOfClass:[NSDictionary class]] ||
+        !peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0 ||
+        !expectedTag || ![expectedTag isKindOfClass:[NSString class]] || expectedTag.length == 0) {
+        return nil;
+    }
 
-    if (![envelope[@"action"] isEqualToString:@"encryptedEnvelope"]) {
+    id actionObj = envelope[@"action"];
+    if (![actionObj isKindOfClass:[NSString class]] || ![actionObj isEqualToString:@"encryptedEnvelope"]) {
         return nil; // Reject unauthenticated plaintext response
     }
 
     NSDictionary *decrypted = [self decryptAndVerifyDictionary:envelope fromPeerId:peerId];
-    if (!decrypted || ![decrypted[@"action"] isEqualToString:@"switchAck"]) {
+    if (!decrypted || ![decrypted isKindOfClass:[NSDictionary class]]) {
         return nil;
     }
 
-    uint64_t ackReqNonce = [decrypted[@"requestNonce"] unsignedLongLongValue];
-    NSString *ackReqTag = decrypted[@"requestTag"];
+    id decActionObj = decrypted[@"action"];
+    if (![decActionObj isKindOfClass:[NSString class]] || ![decActionObj isEqualToString:@"switchAck"]) {
+        return nil;
+    }
+
+    id reqNonceObj = decrypted[@"requestNonce"];
+    id reqTagObj = decrypted[@"requestTag"];
+    id successObj = decrypted[@"success"];
+
+    if (![reqNonceObj isKindOfClass:[NSNumber class]] ||
+        ![reqTagObj isKindOfClass:[NSString class]] ||
+        ![successObj isKindOfClass:[NSNumber class]]) {
+        return nil;
+    }
+
+    uint64_t ackReqNonce = [reqNonceObj unsignedLongLongValue];
+    NSString *ackReqTag = (NSString *)reqTagObj;
 
     // Cryptographically enforce exact request and session binding
     if (ackReqNonce != expectedNonce || ![ackReqTag isEqualToString:expectedTag]) {

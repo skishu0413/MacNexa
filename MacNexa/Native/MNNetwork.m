@@ -217,12 +217,17 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 
 - (void)handleIncomingConnection:(int)sock {
     NSDictionary *msg = [self readMessageFromSocket:sock];
-    if (!msg) {
+    if (!msg || ![msg isKindOfClass:[NSDictionary class]]) {
         close(sock);
         return;
     }
 
-    NSString *action = msg[@"action"];
+    id actionObj = msg[@"action"];
+    if (![actionObj isKindOfClass:[NSString class]]) {
+        close(sock);
+        return;
+    }
+    NSString *action = (NSString *)actionObj;
 
     // 1. Ephemeral ECDH Pairing Key Exchange
     if ([action isEqualToString:@"pairKeyExchange"] || [action isEqualToString:@"pairRequest"]) {
@@ -236,12 +241,22 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
             return;
         }
 
-        NSString *peerId = msg[@"peerId"];
-        NSString *peerName = msg[@"peerName"] ?: @"Remote Mac";
-        NSString *b64RemotePubKey = msg[@"pubKey"];
-        NSData *remotePubKeyData = b64RemotePubKey ? [[NSData alloc] initWithBase64EncodedString:b64RemotePubKey options:0] : nil;
+        id peerIdObj = msg[@"peerId"];
+        id peerNameObj = msg[@"peerName"];
+        id pubKeyObj = msg[@"pubKey"];
 
-        if (!peerId || !remotePubKeyData) {
+        if (![peerIdObj isKindOfClass:[NSString class]] || [(NSString *)peerIdObj length] == 0 || [(NSString *)peerIdObj length] > 256 ||
+            ![pubKeyObj isKindOfClass:[NSString class]] || [(NSString *)pubKeyObj length] == 0) {
+            close(sock);
+            return;
+        }
+
+        NSString *peerId = (NSString *)peerIdObj;
+        NSString *peerName = ([peerNameObj isKindOfClass:[NSString class]] && [(NSString *)peerNameObj length] > 0 && [(NSString *)peerNameObj length] <= 256) ? (NSString *)peerNameObj : @"Remote Mac";
+
+        NSData *remotePubKeyData = [[NSData alloc] initWithBase64EncodedString:(NSString *)pubKeyObj options:0];
+        // Validate decoded key size: P-256 public key is 65 bytes (uncompressed), 33 bytes (compressed), or 91 bytes (X.509)
+        if (!remotePubKeyData || remotePubKeyData.length < 32 || remotePubKeyData.length > 256) {
             close(sock);
             return;
         }
@@ -300,13 +315,31 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 
         // 4. Read Initiator's authenticated confirmation from socket
         NSDictionary *initiatorConfirm = [self readMessageFromSocket:sock];
-        if (!initiatorConfirm || ![initiatorConfirm[@"accepted"] boolValue]) {
+        if (!initiatorConfirm || ![initiatorConfirm isKindOfClass:[NSDictionary class]]) {
             close(sock);
             return;
         }
 
-        NSString *b64InitTag = initiatorConfirm[@"authTag"];
-        NSData *initTag = b64InitTag ? [[NSData alloc] initWithBase64EncodedString:b64InitTag options:0] : nil;
+        id initAccepted = initiatorConfirm[@"accepted"];
+        if (![initAccepted isKindOfClass:[NSNumber class]] || ![initAccepted boolValue]) {
+            close(sock);
+            return;
+        }
+
+        id b64InitTag = initiatorConfirm[@"authTag"];
+        if (![b64InitTag isKindOfClass:[NSString class]] || [(NSString *)b64InitTag length] == 0) {
+            close(sock);
+            return;
+        }
+
+        NSData *initTag = [[NSData alloc] initWithBase64EncodedString:(NSString *)b64InitTag options:0];
+        if (!initTag || initTag.length != 32) {
+            NSDictionary *errReply = @{ @"action": @"pairConfirmResponse", @"accepted": @NO, @"error": @"Invalid confirmation tag size" };
+            [self sendMessage:errReply toSocket:sock];
+            close(sock);
+            return;
+        }
+
         BOOL validInitTag = [[MNSecurity shared] verifyPairingConfirmationTag:initTag
                                                                    withSecret:sharedSecret
                                                                          role:@"initiator"
@@ -360,7 +393,12 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 
     // 2. Authenticated Encrypted Switch Request
     if ([action isEqualToString:@"encryptedEnvelope"]) {
-        NSString *senderId = msg[@"senderId"];
+        id senderIdObj = msg[@"senderId"];
+        if (![senderIdObj isKindOfClass:[NSString class]] || [(NSString *)senderIdObj length] == 0 || [(NSString *)senderIdObj length] > 256) {
+            close(sock);
+            return;
+        }
+        NSString *senderId = (NSString *)senderIdObj;
 
         if (![[MNSecurity shared] isPeerTrusted:senderId]) {
             close(sock);
@@ -369,15 +407,68 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 
         // Decrypt & verify constant-time HMAC-SHA256 signature + replay protection
         NSDictionary *decrypted = [[MNSecurity shared] decryptAndVerifyDictionary:msg fromPeerId:senderId];
-        if (!decrypted || ![decrypted[@"action"] isEqualToString:@"requestSwitch"]) {
+        if (!decrypted || ![decrypted isKindOfClass:[NSDictionary class]]) {
             close(sock);
             return;
         }
 
-        uint64_t reqNonce = [msg[@"nonce"] unsignedLongLongValue];
-        NSString *reqTag = msg[@"tag"] ?: @"";
+        id decActionObj = decrypted[@"action"];
+        if (![decActionObj isKindOfClass:[NSString class]] || ![decActionObj isEqualToString:@"requestSwitch"]) {
+            close(sock);
+            return;
+        }
 
-        NSArray *devices = decrypted[@"devices"];
+        id nonceObj = msg[@"nonce"];
+        id tagObj = msg[@"tag"];
+        if (![nonceObj isKindOfClass:[NSNumber class]] || ![tagObj isKindOfClass:[NSString class]] || [(NSString *)tagObj length] == 0) {
+            close(sock);
+            return;
+        }
+
+        uint64_t reqNonce = [nonceObj unsignedLongLongValue];
+        NSString *reqTag = (NSString *)tagObj;
+
+        // Device-list limits & field validation:
+        id rawDevices = decrypted[@"devices"];
+        if (![rawDevices isKindOfClass:[NSArray class]]) {
+            close(sock);
+            return;
+        }
+        NSArray *deviceArray = (NSArray *)rawDevices;
+        // Limit: maximum 16 devices
+        if (deviceArray.count > 16) {
+            NSLog(@"[MacNexa Network] ⚠️ Switch request exceeded maximum device count (%lu > 16)", (unsigned long)deviceArray.count);
+            close(sock);
+            return;
+        }
+
+        // Validate each device entry
+        NSMutableArray *sanitizedDevices = [NSMutableArray arrayWithCapacity:deviceArray.count];
+        for (id devObj in deviceArray) {
+            if (![devObj isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            NSDictionary *devDict = (NSDictionary *)devObj;
+            id addrObj = devDict[@"address"];
+            id nameObj = devDict[@"name"];
+            id typeObj = devDict[@"type"];
+            id batteryObj = devDict[@"battery"];
+
+            if (![addrObj isKindOfClass:[NSString class]] || [(NSString *)addrObj length] == 0 || [(NSString *)addrObj length] > 64) {
+                continue;
+            }
+
+            NSMutableDictionary *cleanDev = [NSMutableDictionary dictionary];
+            cleanDev[@"address"] = addrObj;
+            cleanDev[@"name"] = ([nameObj isKindOfClass:[NSString class]] && [(NSString *)nameObj length] <= 128) ? nameObj : @"Accessory";
+            cleanDev[@"type"] = ([typeObj isKindOfClass:[NSString class]] && [(NSString *)typeObj length] <= 64) ? typeObj : @"unknown";
+            if ([batteryObj isKindOfClass:[NSNumber class]]) {
+                cleanDev[@"battery"] = batteryObj;
+            }
+            [sanitizedDevices addObject:cleanDev];
+        }
+
+        NSArray *devices = [sanitizedDevices copy];
         NSString *peerName = [[MNSecurity shared] trustedPeerInfo:senderId][@"name"] ?: @"Remote Mac";
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self.delegate) [self.delegate networkSwitchDidStartWithPeer:peerName isOutgoing:NO];
@@ -409,6 +500,7 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 #pragma mark - Messaging
 
 - (void)sendMessage:(NSDictionary *)dict toSocket:(int)sock {
+    if (!dict || ![dict isKindOfClass:[NSDictionary class]]) return;
     NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
     if (!data || data.length > kMNMaxFrameSize) return;
     uint32_t len = htonl((uint32_t)data.length);
@@ -427,13 +519,21 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
     r = recv(sock, data.mutableBytes, len, MSG_WAITALL);
     if (r != len) return nil;
 
-    return [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+    return (NSDictionary *)json;
 }
 
 - (int)connectToPeer:(NSDictionary *)peerInfo {
-    NSString *ip = peerInfo[@"ip"];
-    int port = [peerInfo[@"port"] intValue];
-    if (!ip) return -1;
+    if (!peerInfo || ![peerInfo isKindOfClass:[NSDictionary class]]) return -1;
+    id ipObj = peerInfo[@"ip"];
+    id portObj = peerInfo[@"port"];
+    if (![ipObj isKindOfClass:[NSString class]] || (![portObj isKindOfClass:[NSNumber class]] && ![portObj isKindOfClass:[NSString class]])) return -1;
+    NSString *ip = (NSString *)ipObj;
+    int port = [portObj intValue];
+    if (port <= 0 || port > 65535) return -1;
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
@@ -444,7 +544,10 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, [ip UTF8String], &addr.sin_addr);
+    if (inet_pton(AF_INET, [ip UTF8String], &addr.sin_addr) <= 0) {
+        close(sock);
+        return -1;
+    }
 
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(sock);
@@ -456,6 +559,11 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 #pragma mark - Public Actions
 
 - (void)pairWithPeer:(NSDictionary *)peer completion:(void(^)(BOOL success, NSString * _Nullable error))completion {
+    if (!peer || ![peer isKindOfClass:[NSDictionary class]]) {
+        if (completion) completion(NO, @"Invalid peer configuration");
+        return;
+    }
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         int sock = [self connectToPeer:peer];
         if (sock < 0) {
@@ -475,7 +583,8 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
             return;
         }
 
-        NSString *targetPeerId = peer[@"id"];
+        id peerIdObj = peer[@"id"];
+        NSString *targetPeerId = ([peerIdObj isKindOfClass:[NSString class]]) ? (NSString *)peerIdObj : @"";
 
         // 1. Exchange public keys FIRST (raw secret is NEVER transmitted!)
         NSDictionary *req = @{
@@ -488,15 +597,37 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 
         // Wait for peer's public key response (machine-to-machine, automated)
         NSDictionary *resp = [self readMessageFromSocket:sock];
-        if (!resp || ![resp[@"accepted"] boolValue] || !resp[@"pubKey"]) {
+        if (!resp || ![resp isKindOfClass:[NSDictionary class]]) {
             close(sock);
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(NO, resp[@"error"] ?: @"Pairing key exchange was declined or timed out");
+                if (completion) completion(NO, @"Malformed response from peer");
             });
             return;
         }
 
-        NSData *remotePubKeyData = [[NSData alloc] initWithBase64EncodedString:resp[@"pubKey"] options:0];
+        id respAccepted = resp[@"accepted"];
+        id respPubKey = resp[@"pubKey"];
+        if (![respAccepted isKindOfClass:[NSNumber class]] || ![respAccepted boolValue] ||
+            ![respPubKey isKindOfClass:[NSString class]] || [(NSString *)respPubKey length] == 0) {
+            id errObj = resp[@"error"];
+            NSString *errMsg = [errObj isKindOfClass:[NSString class]] ? (NSString *)errObj : @"Pairing key exchange was declined or timed out";
+            close(sock);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(NO, errMsg);
+            });
+            return;
+        }
+
+        NSData *remotePubKeyData = [[NSData alloc] initWithBase64EncodedString:(NSString *)respPubKey options:0];
+        // Validate decoded key size: P-256 public key is 65 bytes (uncompressed), 33 bytes (compressed), or 91 bytes (X.509)
+        if (!remotePubKeyData || remotePubKeyData.length < 32 || remotePubKeyData.length > 256) {
+            close(sock);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(NO, @"Invalid public key received from peer");
+            });
+            return;
+        }
+
         NSData *sharedSecret = [[MNSecurity shared] deriveSharedSecretWithPrivateKey:localPair.privateKey
                                                                 remotePublicKeyData:remotePubKeyData];
         if (!sharedSecret) {
@@ -507,8 +638,10 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
             return;
         }
 
-        NSString *remotePeerId = resp[@"peerId"] ?: targetPeerId;
-        NSString *remotePeerName = resp[@"peerName"] ?: peer[@"name"];
+        id respPeerId = resp[@"peerId"];
+        id respPeerName = resp[@"peerName"];
+        NSString *remotePeerId = ([respPeerId isKindOfClass:[NSString class]] && [(NSString *)respPeerId length] > 0 && [(NSString *)respPeerId length] <= 256) ? (NSString *)respPeerId : targetPeerId;
+        NSString *remotePeerName = ([respPeerName isKindOfClass:[NSString class]] && [(NSString *)respPeerName length] > 0 && [(NSString *)respPeerName length] <= 256) ? (NSString *)respPeerName : (peer[@"name"] ?: @"Remote Mac");
 
         // 2. Both sides calculate matching SAS verification code
         NSString *sasCode = [[MNSecurity shared] computeSASFromSecret:sharedSecret
@@ -561,15 +694,39 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
         NSDictionary *confirmResp = [self readMessageFromSocket:sock];
         close(sock);
 
-        if (!confirmResp || ![confirmResp[@"accepted"] boolValue]) {
+        if (!confirmResp || ![confirmResp isKindOfClass:[NSDictionary class]]) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(NO, confirmResp[@"error"] ?: @"Pairing was declined by the remote Mac or timed out");
+                if (completion) completion(NO, @"Invalid confirmation response from peer");
             });
             return;
         }
 
-        NSString *b64RecvTag = confirmResp[@"authTag"];
-        NSData *recvTag = b64RecvTag ? [[NSData alloc] initWithBase64EncodedString:b64RecvTag options:0] : nil;
+        id confAccepted = confirmResp[@"accepted"];
+        if (![confAccepted isKindOfClass:[NSNumber class]] || ![confAccepted boolValue]) {
+            id errObj = confirmResp[@"error"];
+            NSString *errMsg = [errObj isKindOfClass:[NSString class]] ? (NSString *)errObj : @"Pairing was declined by the remote Mac or timed out";
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(NO, errMsg);
+            });
+            return;
+        }
+
+        id b64RecvTag = confirmResp[@"authTag"];
+        if (![b64RecvTag isKindOfClass:[NSString class]] || [(NSString *)b64RecvTag length] == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(NO, @"Malformed confirmation authTag");
+            });
+            return;
+        }
+
+        NSData *recvTag = [[NSData alloc] initWithBase64EncodedString:(NSString *)b64RecvTag options:0];
+        if (!recvTag || recvTag.length != 32) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(NO, @"Invalid confirmation tag size");
+            });
+            return;
+        }
+
         BOOL validRecvTag = [[MNSecurity shared] verifyPairingConfirmationTag:recvTag
                                                                    withSecret:sharedSecret
                                                                          role:@"receiver"
@@ -602,14 +759,19 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
 }
 
 - (void)switchToPeer:(NSString *)peerId completion:(void(^)(BOOL success, NSString * _Nullable error))completion {
+    if (!peerId || ![peerId isKindOfClass:[NSString class]] || peerId.length == 0) {
+        if (completion) completion(NO, @"Invalid peer identifier");
+        return;
+    }
+
     NSDictionary *trusted = [[MNSecurity shared] trustedPeerInfo:peerId];
-    if (!trusted) {
+    if (!trusted || ![trusted isKindOfClass:[NSDictionary class]]) {
         if (completion) completion(NO, @"Peer is not trusted");
         return;
     }
 
     NSDictionary *peerInfo = self.peersById[peerId];
-    if (!peerInfo) {
+    if (!peerInfo || ![peerInfo isKindOfClass:[NSDictionary class]]) {
         if (completion) completion(NO, @"Peer is currently offline or unreachable on local network");
         return;
     }
@@ -620,8 +782,11 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
     });
 
     NSArray *devices = [[MNBluetoothManager shared] fetchConnectedAccessories];
-    if (devices.count == 0) {
+    if (![devices isKindOfClass:[NSArray class]] || devices.count == 0) {
         devices = [[MNBluetoothManager shared] rememberedAccessories];
+    }
+    if (![devices isKindOfClass:[NSArray class]]) {
+        devices = @[];
     }
 
     // Step 1: Release accessories locally
@@ -679,12 +844,23 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
             NSDictionary *wireAck = [self readMessageFromSocket:sock];
             close(sock);
 
+            if (!wireAck || ![wireAck isKindOfClass:[NSDictionary class]]) {
+                // Rollback!
+                [[MNBluetoothManager shared] acquireAccessories:devices completion:^(BOOL s, NSString *e) {}];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSString *failErr = @"Invalid or empty response from peer";
+                    if (self.delegate) [self.delegate networkSwitchDidCompleteWithPeer:peerName success:NO error:failErr];
+                    if (completion) completion(NO, failErr);
+                });
+                return;
+            }
+
             // Decrypt and authenticate acknowledgment, verifying bindings to peer, session, and exact request
             NSDictionary *decryptedAck = [[MNSecurity shared] decryptAndVerifySwitchAcknowledgment:wireAck
                                                                                       expectedPeer:peerId
                                                                                       requestNonce:nonce
                                                                                         requestTag:requestTag];
-            if (!decryptedAck) {
+            if (!decryptedAck || ![decryptedAck isKindOfClass:[NSDictionary class]]) {
                 // Unauthenticated, plain, tampered, or mismatched acknowledgment! Rollback!
                 [[MNBluetoothManager shared] acquireAccessories:devices completion:^(BOOL s, NSString *e) {}];
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -695,8 +871,10 @@ static const uint32_t kMNMaxFrameSize = 65536; // 64 KB maximum payload guard
                 return;
             }
 
-            BOOL success = [decryptedAck[@"success"] boolValue];
-            NSString *err = (decryptedAck[@"error"] && decryptedAck[@"error"] != [NSNull null]) ? decryptedAck[@"error"] : nil;
+            id succObj = decryptedAck[@"success"];
+            BOOL success = [succObj isKindOfClass:[NSNumber class]] ? [succObj boolValue] : NO;
+            id errObj = decryptedAck[@"error"];
+            NSString *err = ([errObj isKindOfClass:[NSString class]] && [(NSString *)errObj length] > 0) ? (NSString *)errObj : nil;
 
             if (!success) {
                 // Remote peer failed to acquire: Rollback!

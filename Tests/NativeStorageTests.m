@@ -428,15 +428,110 @@ int main(int argc, const char * argv[]) {
         ASSERT_TRUE(wrongPeerResult == nil, "Switch acknowledgment from unexpected peer MUST be rejected!");
 
         // -------------------------------------------------------------
-        // Test 8: Cleanup
+        // Test 8: Incoming JSON Type & Boundary Validation
         // -------------------------------------------------------------
-        printf("  [8/8] Cleaning up test sandbox...\n");
+        printf("  [8/9] Testing incoming JSON type safety, decoded key sizes, and boundary limits...\n");
+
+        // 1. Top-level object validation: valid JSON array or string passed where dictionary is expected
+        NSArray *jsonArrayPayload = @[ @"action", @"pairRequest", @123 ];
+        NSDictionary *topLevelArrayRes = [securityA decryptAndVerifyDictionary:(NSDictionary *)jsonArrayPayload fromPeerId:macBId];
+        ASSERT_TRUE(topLevelArrayRes == nil, "Top-level JSON array MUST return nil without throwing exception");
+
+        NSString *jsonStringPayload = @"not_a_dictionary";
+        NSDictionary *topLevelStringRes = [securityA decryptAndVerifyDictionary:(NSDictionary *)jsonStringPayload fromPeerId:macBId];
+        ASSERT_TRUE(topLevelStringRes == nil, "Top-level JSON string MUST return nil without throwing exception");
+
+        NSNumber *jsonNumPayload = @(42);
+        NSDictionary *topLevelNumRes = [securityA decryptAndVerifyDictionary:(NSDictionary *)jsonNumPayload fromPeerId:macBId];
+        ASSERT_TRUE(topLevelNumRes == nil, "Top-level JSON number MUST return nil without throwing exception");
+
+        // 2. Peer ID type validation: non-string or empty peer ID
+        NSDictionary *badPeerRes = [securityA decryptAndVerifyDictionary:switchReqEnvelope fromPeerId:(NSString *)@[ @"peer" ]];
+        ASSERT_TRUE(badPeerRes == nil, "Non-string peer ID MUST return nil without throwing exception");
+
+        NSDictionary *emptyPeerRes = [securityA decryptAndVerifyDictionary:switchReqEnvelope fromPeerId:@""];
+        ASSERT_TRUE(emptyPeerRes == nil, "Empty peer ID MUST return nil without throwing exception");
+
+        // 3. Envelope field type validation: wrongly typed nonce, timestamp, or tag
+        NSMutableDictionary *badNonceEnv = [switchReqEnvelope mutableCopy];
+        badNonceEnv[@"nonce"] = @[ @(12345) ]; // Array instead of NSNumber
+        NSDictionary *badNonceRes = [securityB decryptAndVerifyDictionary:badNonceEnv fromPeerId:macAId];
+        ASSERT_TRUE(badNonceRes == nil, "Envelope with array nonce MUST return nil without throwing exception");
+
+        NSMutableDictionary *badStrNonceEnv = [switchReqEnvelope mutableCopy];
+        badStrNonceEnv[@"nonce"] = @"not_a_number"; // String instead of NSNumber
+        NSDictionary *badStrNonceRes = [securityB decryptAndVerifyDictionary:badStrNonceEnv fromPeerId:macAId];
+        ASSERT_TRUE(badStrNonceRes == nil, "Envelope with string nonce MUST return nil without throwing exception");
+
+        NSMutableDictionary *badTsEnv = [switchReqEnvelope mutableCopy];
+        badTsEnv[@"timestamp"] = @"not_a_number"; // String instead of NSNumber
+        NSDictionary *badTsRes = [securityB decryptAndVerifyDictionary:badTsEnv fromPeerId:macAId];
+        ASSERT_TRUE(badTsRes == nil, "Envelope with string timestamp MUST return nil without throwing exception");
+
+        NSMutableDictionary *badTagEnv = [switchReqEnvelope mutableCopy];
+        badTagEnv[@"tag"] = @(9999); // NSNumber instead of NSString
+        NSDictionary *badTagRes = [securityB decryptAndVerifyDictionary:badTagEnv fromPeerId:macAId];
+        ASSERT_TRUE(badTagRes == nil, "Envelope with numeric tag MUST return nil without throwing exception");
+
+        NSMutableDictionary *emptyTagEnv = [switchReqEnvelope mutableCopy];
+        emptyTagEnv[@"tag"] = @"";
+        NSDictionary *emptyTagRes = [securityB decryptAndVerifyDictionary:emptyTagEnv fromPeerId:macAId];
+        ASSERT_TRUE(emptyTagRes == nil, "Envelope with empty tag MUST return nil without throwing exception");
+
+        // 4. Decoded public key size boundaries: 32 <= length <= 256
+        MNEphemeralKeyPair *testPair = [securityA generateEphemeralKeyPair];
+        ASSERT_TRUE(testPair != nil, "Ephemeral keypair generation must succeed");
+
+        NSData *undersizedKey = [NSMutableData dataWithLength:16]; // 16 bytes < 32 bytes minimum
+        NSData *underSecret = [securityA deriveSharedSecretWithPrivateKey:testPair.privateKey remotePublicKeyData:undersizedKey];
+        ASSERT_TRUE(underSecret == nil, "Undersized public key (< 32 bytes) MUST return nil");
+
+        NSData *oversizedKey = [NSMutableData dataWithLength:512]; // 512 bytes > 256 bytes maximum
+        NSData *overSecret = [securityA deriveSharedSecretWithPrivateKey:testPair.privateKey remotePublicKeyData:oversizedKey];
+        ASSERT_TRUE(overSecret == nil, "Oversized public key (> 256 bytes) MUST return nil");
+
+        NSData *badKeyTypeSecret = [securityA deriveSharedSecretWithPrivateKey:testPair.privateKey remotePublicKeyData:(NSData *)@"not_nsdata"];
+        ASSERT_TRUE(badKeyTypeSecret == nil, "Wrongly typed public key object MUST return nil without throwing exception");
+
+        // 5. Switch acknowledgment envelope type validation
+        NSDictionary *arrayAckRes = [securityA decryptAndVerifySwitchAcknowledgment:(NSDictionary *)@[ @YES ]
+                                                                      expectedPeer:macBId
+                                                                      requestNonce:switchReqNonce
+                                                                        requestTag:reqTag];
+        ASSERT_TRUE(arrayAckRes == nil, "Top-level array acknowledgment MUST return nil without throwing exception");
+
+        NSDictionary *numActionAck = @{ @"action": @(123) }; // Action is NSNumber instead of NSString
+        NSDictionary *numActionRes = [securityA decryptAndVerifySwitchAcknowledgment:numActionAck
+                                                                        expectedPeer:macBId
+                                                                        requestNonce:switchReqNonce
+                                                                          requestTag:reqTag];
+        ASSERT_TRUE(numActionRes == nil, "Acknowledgment with numeric action MUST return nil without throwing exception");
+
+        // 6. Pairing confirmation tag type safety
+        BOOL badTagRes1 = [securityA verifyPairingConfirmationTag:(NSData *)@"not_data"
+                                                       withSecret:testSecret
+                                                             role:@"initiator"
+                                                     senderPeerId:macBId
+                                                   receiverPeerId:macAId];
+        ASSERT_TRUE(badTagRes1 == NO, "String confirmation tag MUST return NO without throwing exception");
+
+        BOOL badTagRes2 = [securityA verifyPairingConfirmationTag:[NSMutableData dataWithLength:16] // Wrong length (16 != 32)
+                                                       withSecret:testSecret
+                                                             role:@"initiator"
+                                                     senderPeerId:macBId
+                                                   receiverPeerId:macAId];
+        ASSERT_TRUE(badTagRes2 == NO, "16-byte confirmation tag MUST return NO without throwing exception");
+
+        // -------------------------------------------------------------
+        // Test 9: Cleanup
+        // -------------------------------------------------------------
+        printf("  [9/9] Cleaning up test sandbox...\n");
         [receiverMac resetReplayHistory];
         [securityA resetReplayHistory];
         [securityB resetReplayHistory];
         [fm removeItemAtPath:tmpDir error:nil];
 
-        printf("✅ All 8 test suites PASSED successfully!\n");
+        printf("✅ All 9 test suites PASSED successfully!\n");
     }
     return 0;
 }
