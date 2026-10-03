@@ -183,9 +183,15 @@ EOF
 # 3. Ad-Hoc Code Sign with Entitlements
 # ------------------------------------------------------------------------------
 ENTITLEMENTS="$ROOT_DIR/MacNexa/Resources/MacNexa-Debug.entitlements"
-if [[ -f "$ENTITLEMENTS" ]]; then
-  log_info "Signing MacNexa with Bluetooth & Local Network entitlements..."
-  codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_DIR" >/dev/null 2>&1 || true
+if [[ ! -f "$ENTITLEMENTS" ]]; then
+  log_err "Entitlements file not found: $ENTITLEMENTS"
+  exit 1
+fi
+
+log_info "Signing MacNexa with Bluetooth & Local Network entitlements..."
+if ! codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_DIR"; then
+  log_err "Code signing failed for $APP_DIR"
+  exit 1
 fi
 
 if [[ "$MODE" == "build" ]]; then

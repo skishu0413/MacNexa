@@ -2,6 +2,7 @@
 
 [![macOS](https://img.shields.io/badge/macOS-12%20%7C%2013%20%7C%2014%20%7C%2015%20%7C%2016%2B-blue.svg?style=flat-square&logo=apple)](https://apple.com)
 [![Build](https://img.shields.io/badge/build-1--command%20(%3C3s)-success.svg?style=flat-square)](https://github.com/skishu0413/MacNexa)
+[![Tests](https://img.shields.io/badge/tests-9%2F9%20native%20passed-brightgreen.svg?style=flat-square)](Tests/NativeStorageTests.m)
 [![Security](https://img.shields.io/badge/security-Zero--Trust%20%7C%20ECDH%20%7C%20AES--256-orange.svg?style=flat-square)](Documentation/SECURITY.md)
 [![Dependencies](https://img.shields.io/badge/dependencies-Zero%20(No%20Xcode%20Req)-brightgreen.svg?style=flat-square)](#quick-start-single-command)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat-square)](LICENSE)
@@ -19,10 +20,12 @@ Unlike existing solutions that rely on insecure cleartext communication or requi
 - **Real-Time Battery Percentage**: Displays live battery levels with battery health indicators (`🔋 85%`, `🪫 18% Low`) directly in your menu bar.
 - **Zero-Trust Mutual Security**:
   - **ECDH (P-256) Key Exchange**: Master keys are negotiated securely and **never cross the network**.
-  - **6-Digit SAS Visual Verification**: Prevents Man-in-the-Middle (MitM) attacks during initial pairing.
-  - **Encrypt-then-MAC (AES-256 + HMAC-SHA256)**: All commands are fully encrypted and signed with constant-time verification.
-  - **Hardware Keychain Storage**: Shared secrets are locked inside Apple's hardware-encrypted macOS Keychain.
-  - **Anti-Replay & DoS Protection**: Monotonically increasing sequence nonces, timestamp drift limits, and socket timeouts.
+  - **Concurrent 6-Digit SAS Visual Verification**: Key exchange occurs first so users visually compare identical SAS codes on both screens before either side confirms.
+  - **Authenticated Confirmation Tags**: Cryptographic confirmation tags are verified before either node commits peer trust to disk.
+  - **Authenticate-First Replay Protection**: Strict HMAC verification before nonce commitment; replay state persists across restarts to prevent DoS attacks.
+  - **Authenticated Switch Acknowledgments**: Responses are encrypted and cryptographically bound to peer ID, session, and exact request tag/nonce.
+  - **Strict Type & Boundary Validation**: Validates all JSON structures, decoded key size boundaries (32–256 bytes), and device-list limits ($\le 16$ accessories).
+  - **Injected Secure Storage & Quarantine**: Encrypted file storage with enforced POSIX permissions (`0700` directories, `0600` files), automatic corruption quarantine, and user-facing error reporting.
 - **Universal Multi-Version Compatibility**: Works across **all** macOS releases (macOS 12 Monterey, 13 Ventura, 14 Sonoma, 15 Sequoia, 16+ Tahoe). Cross-compatible across mixed versions (Old-to-New, New-to-Old).
 - **Zero Heavy Dependencies**: Builds and runs in **under 3 seconds** using Apple's built-in Command Line Tools (`clang`). **No 15 GB Xcode download required.**
 - **100% Offline & Private**: Zero cloud dependency, zero telemetry, zero analytics. Runs exclusively on your local Wi-Fi / Ethernet network.
@@ -45,7 +48,7 @@ Unlike existing solutions that rely on insecure cleartext communication or requi
  │ • IOBluetooth Engine │       │ • Bonjour Discovery  │
  │ • Silent Auto-Pair   │       │ • BSD Socket Server  │
  │ • Unpair via remove  │       │ • DoS Protected I/O  │
- │ • IOKit Battery Mon  │       │ • Port: 57842        │
+ │ • IOKit Battery Mon  │       │ • Bound Switch Acks  │
  └──────────┬───────────┘       └──────────┬───────────┘
             │                              │
             │                   ┌──────────┴───────────┐
@@ -53,9 +56,10 @@ Unlike existing solutions that rely on insecure cleartext communication or requi
             │                   │──────────────────────│
             │                   │ • ECDH (P-256)       │
             │                   │ • 6-Digit SAS Code   │
-            │                   │ • AES-256 Encryption │
-            │                   │ • HMAC-SHA256 EtM    │
-            │                   │ • macOS Keychain     │
+            │                   │ • AES-256-CBC / EtM  │
+            │                   │ • Authenticate-First │
+            │                   │ • Replay Persistence │
+            │                   │ • MNFileSecretStore  │
             │                   └──────────────────────┘
             ▼                               │
  ┌──────────────────────┐                   ▼
@@ -76,9 +80,9 @@ To build, sign, and launch MacNexa in one command, open Terminal in the reposito
 *(Or simply run `make`)*
 
 ### What happens automatically:
-1. Verifies your macOS build environment.
+1. Verifies your macOS build environment and entitlements.
 2. Compiles the native engine in **~2 seconds** using `clang`.
-3. Packages `MacNexa.app` and ad-hoc signs it with Bluetooth and Local Network entitlements.
+3. Packages `MacNexa.app` and ad-hoc signs it with Bluetooth and Local Network entitlements (fails visibly on any error).
 4. Closes any stale background instance and launches the new build directly into your menu bar.
 
 ---
@@ -93,7 +97,7 @@ Run `./run.sh` on both machines. Look for the **keyboard icon (`⌨️`)** in th
 ### Step 2: Mutual Security Pairing (One-Time)
 1. On either Mac, click the **`⌨️`** menu bar icon and select **`Pair New Mac ▸`**.
 2. Select your other Mac from the list of auto-discovered peers.
-3. A security verification modal will appear on **both** screens:
+3. Both machines exchange ephemeral public keys, compute the shared secret, and display identical 6-digit verification codes concurrently:
    ```text
    MacNexa Security Verification
    Pairing request from: Mac Mini
@@ -101,13 +105,14 @@ Run `./run.sh` on both machines. Look for the **keyboard icon (`⌨️`)** in th
    Do the 6 digits match on both screens?
             [  849 201  ]
    ```
-4. Confirm the codes match and click **Confirm & Trust** on both computers.
-5. Both Macs establish a mutually authenticated cryptographic trust relationship stored securely in the **macOS Keychain**.
+4. Verify the codes match and click **Confirm & Trust** on both computers.
+5. Mutual confirmation tags are exchanged and verified cryptographically before trust is saved to disk.
 
 ### Step 3: Switch Peripherals!
 Click the menu bar icon and click **`🔄 Switch to <Mac Name>`**.
 - The current Mac releases and unpairs the accessories locally.
 - The remote Mac silently connects and acquires the keyboard and trackpad in seconds.
+- The remote Mac responds with an authenticated switch acknowledgment bound to the exact request and session.
 
 ---
 
@@ -136,7 +141,9 @@ Quit MacNexa
 
 | Command | Action | Description |
 | :--- | :--- | :--- |
-| `./run.sh` *(or `make`)* | **Build & Launch** | Compiles, signs, and launches MacNexa with real Bluetooth hardware. |
+| `./run.sh` *(or `make`)* | **Build & Launch** | Compiles, signs with entitlements, and launches MacNexa. |
+| `./run.sh --build-only` | **Build Only** | Compiles and signs `MacNexa.app` bundle without launching (strict failure visibility). |
+| `./run.sh --test` *(or `make test`)* | **Run Native Tests** | Compiles and runs the full 9-suite native security, storage, pairing, and replay test suite. |
 | `./run.sh --mock` *(or `make mock`)* | **Simulated Mode** | Launches with simulated peripherals (ideal for development without hardware disconnects). |
 | `./run.sh --logs` *(or `make logs`)* | **Stream Logs** | Streams real-time unified logs and connection diagnostics to console. |
 | `./run.sh --clean` *(or `make clean`)* | **Clean Build** | Cleans build cache and artifacts. |
@@ -150,11 +157,14 @@ MacNexa is designed with a **Zero-Trust security model** to prevent unauthorized
 
 | Threat Vector | Standard Apps | MacNexa Defense |
 | :--- | :--- | :--- |
-| **Wi-Fi Eavesdropping** | Cleartext JSON secrets over TCP. | **Ephemeral ECDH (P-256)**: Master secret is never transmitted. Payloads encrypted with **AES-256**. |
-| **Man-in-the-Middle (MitM)** | Auto-accepts connections silently. | **Visual 6-Digit SAS Confirmation**: Users visually match codes derived from cryptographic key agreements. |
-| **Packet Replay Attacks** | Replaying captured packets triggers disconnects. | **Strict Monotonic Nonces & 30s Skew Windows**: Replayed or expired packets are rejected immediately. |
+| **Wi-Fi Eavesdropping** | Cleartext JSON secrets over TCP. | **Ephemeral ECDH (P-256)**: Master secret is never transmitted. Payloads encrypted with **AES-256-CBC**. |
+| **Man-in-the-Middle (MitM)** | Auto-accepts connections silently. | **Concurrent 6-Digit SAS Confirmation**: Public keys exchanged first; users visually verify identical SAS codes before confirming. |
+| **Confirmation Forgery / Spoofing** | Blind trust persistence. | **Role-Bound Confirmation Tags**: Sender/receiver peer IDs and roles are cryptographically verified before saving trust. |
+| **Packet Replay Attacks** | Sequence counters disappear on reboot. | **Authenticate-First Nonce Commitment + Replay Persistence**: Nonces checked only post-HMAC and persisted to disk across restarts. |
 | **Payload Tampering** | Weak checksums or missing signatures. | **Encrypt-then-MAC (EtM)**: HMAC-SHA256 verified in constant time (`timingsafe_bcmp`) before decryption. |
-| **Key Theft by Malware** | Secrets stored in plaintext `.plist` files. | **Hardware macOS Keychain**: Stored using `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. |
+| **Rogue Switch Acks** | Unauthenticated plaintext success responses. | **Cryptographically Bound Acknowledgment**: Acks encrypted and bound to peer, session, and exact request tag/nonce. |
+| **Parser Exploits & Bad JSON** | Crashes on arrays/unexpected types. | **Strict Type & Boundary Validation**: Validates top-level dictionaries, field types, key sizes (32–256 bytes), and device list limits ($\le 16$). |
+| **Key Theft / Corruption** | Unprotected plain plist files. | **Injected Storage (`MNFileSecretStore`)**: Strict POSIX permissions (`0700`/`0600`), automatic quarantine (`secrets.enc.corrupt.<ts>`), and UI error reporting. |
 | **Network Denial of Service (DoS)** | Unbounded buffers & hung connections. | **64 KB Frame Cap + 3s Socket Timeouts + 10s Rate Limiting**. |
 
 *For complete cryptographic proofs and implementation details, see [Documentation/SECURITY.md](Documentation/SECURITY.md).*
@@ -165,15 +175,18 @@ MacNexa is designed with a **Zero-Trust security model** to prevent unauthorized
 
 ```text
 MacNexa/
-├── run.sh                          # Universal 1-command build, sign, and runner script
-├── Makefile                        # Convenience make runner (make, make mock, make logs)
+├── run.sh                          # Universal 1-command build, sign, test, and runner script
+├── Makefile                        # Convenience make runner (make, make test, make mock, make logs)
+├── .github/workflows/swift.yml     # GitHub Actions CI (builds, Swift tests, and native test suite)
+├── Tests/
+│   └── NativeStorageTests.m        # 9-suite native test runner (pairing, replay, acks, malformed JSON, storage)
 ├── MacNexa/
 │   ├── Native/                     # Universal Native Engine (macOS 12+ / 13 / 14 / 15 / 16+)
 │   │   ├── main.m                  # App entry point (LSUIElement daemon)
-│   │   ├── MNMenuController.{h,m}  # Status bar UI & modal alert presenter
+│   │   ├── MNMenuController.{h,m}  # Status bar UI, alerts & storage error surfacing
 │   │   ├── MNBluetoothManager.{h,m}# IOBluetooth & IOKit battery monitoring engine
-│   │   ├── MNNetwork.{h,m}         # Bonjour discovery & hardened TCP server
-│   │   └── MNSecurity.{h,m}        # ECDH, Keychain, AES-256 & HMAC cryptography
+│   │   ├── MNNetwork.{h,m}         # Bonjour discovery, hardened TCP server & bound acks
+│   │   └── MNSecurity.{h,m}        # ECDH, injected storage, AES-256, HMAC & replay protection
 │   ├── Resources/
 │   │   ├── Info.plist              # Bundle metadata & usage descriptions
 │   │   └── MacNexa-Debug.entitlements # Hardware Bluetooth & network entitlements

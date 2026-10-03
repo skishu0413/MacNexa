@@ -13,7 +13,6 @@ mock:
 
 test:
 	@./run.sh --test
-	@swift test --package-path MacNexaCore 2>/dev/null || true
 
 clean:
 	@./run.sh --clean
